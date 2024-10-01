@@ -1,4 +1,5 @@
 import os
+import platform
 import re
 import shutil
 import sys
@@ -133,7 +134,11 @@ def test_venv_activate(pdm, mocker, project):
         assert result.output.startswith("conda activate")
     else:
         assert result.output.strip("'\"\n").endswith("activate")
-        assert result.output.startswith("source")
+        if platform.system() == "Windows":
+            assert not result.output.startswith("source")
+            assert not result.output.startswith("'")
+        else:
+            assert result.output.startswith("source")
 
 
 @pytest.mark.usefixtures("venv_backends")
@@ -186,7 +191,11 @@ def test_venv_activate_no_shell(pdm, mocker, project):
         assert result.output.startswith("conda activate")
     else:
         assert result.output.strip("'\"\n").endswith("activate")
-        assert result.output.startswith("source")
+        if platform.system() == "Windows":
+            assert not result.output.startswith("source")
+            assert not result.output.startswith("'")
+        else:
+            assert result.output.startswith("source")
 
 
 @pytest.mark.usefixtures("fake_create")
@@ -199,7 +208,7 @@ def test_venv_auto_create(pdm, mocker, project, keep_pypackages):
     else:
         shutil.rmtree(project.root / "__pypackages__", ignore_errors=True)
     project.project_config["python.use_venv"] = True
-    pdm(["install"], obj=project)
+    pdm(["install", "--no-self"], obj=project)
     if keep_pypackages:
         creator.assert_not_called()
     else:

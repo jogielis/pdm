@@ -4,7 +4,6 @@ import argparse
 from pathlib import Path
 from typing import Iterable
 
-from pdm.cli.actions import resolve_candidates_from_lockfile
 from pdm.cli.commands.base import BaseCommand
 from pdm.cli.filters import GroupSelection
 from pdm.cli.options import groups_group, lockfile_option
@@ -13,6 +12,7 @@ from pdm.formats import FORMATS
 from pdm.models.candidates import Candidate
 from pdm.models.requirements import Requirement
 from pdm.project import Project
+from pdm.project.lockfile import FLAG_INHERIT_METADATA
 
 
 class Command(BaseCommand):
@@ -23,9 +23,9 @@ class Command(BaseCommand):
         parser.add_argument(
             "-f",
             "--format",
-            choices=FORMATS.keys(),
+            choices=["requirements"],
             default="requirements",
-            help="Specify the export file format",
+            help="Only requirements.txt is supported for now.",
         )
         groups_group.add_to_parser(parser)
         parser.add_argument(
@@ -37,7 +37,14 @@ class Command(BaseCommand):
             help="Don't include artifact hashes",
         )
         parser.add_argument(
-            "--no-markers", action="store_false", default=True, dest="markers", help="Don't include platform markers"
+            "--no-markers",
+            action="store_false",
+            default=True,
+            dest="markers",
+            help="(DEPRECATED)Don't include platform markers",
+        )
+        parser.add_argument(
+            "--no-extras", action="store_false", default=True, dest="extras", help="Strip extras from the requirements"
         )
         parser.add_argument(
             "-o",
@@ -60,22 +67,44 @@ class Command(BaseCommand):
         if options.pyproject:
             options.hashes = False
         selection = GroupSelection.from_options(project, options)
-        requirements: dict[str, Requirement] = {}
+        if options.markers is False:
+            project.core.ui.warn(
+                "The --no-markers option is on, the exported requirements can only work on the current platform"
+            )
         packages: Iterable[Requirement] | Iterable[Candidate]
-        for group in selection:
-            requirements.update(project.get_dependencies(group))
         if options.pyproject:
-            packages = requirements.values()
+            packages = [r for group in selection for r in project.get_dependencies(group)]
         else:
             if not project.lockfile.exists():
                 raise PdmUsageError("No lockfile found, please run `pdm lock` first.")
-
-            candidates = resolve_candidates_from_lockfile(
-                project, requirements.values(), groups=set(selection), cross_platform=options.markers
+            if FLAG_INHERIT_METADATA not in project.lockfile.strategy:
+                raise PdmUsageError(
+                    "Can't export a lock file without environment markers, please re-generate the lock file with `inherit_metadata` strategy."
+                )
+            candidates = sorted(
+                (entry.candidate for entry in project.get_locked_repository().packages.values()),
+                key=lambda c: not c.req.extras,
             )
-            # Remove candidates with [extras] because the bare candidates are already
-            # included
-            packages = (candidate for candidate in candidates.values() if not candidate.req.extras)
+            groups = set(selection)
+            packages = []
+            seen_extras: set[str] = set()
+            this_spec = project.environment.spec
+            for candidate in candidates:
+                if groups.isdisjoint(candidate.req.groups):
+                    continue
+                if options.extras:
+                    key = candidate.req.key or ""
+                    if candidate.req.extras:
+                        seen_extras.add(key)
+                    elif key in seen_extras:
+                        continue
+                elif candidate.req.extras:
+                    continue
+                if not options.markers and candidate.req.marker:
+                    if not candidate.req.marker.matches(this_spec):
+                        continue
+                    candidate.req.marker = None
+                packages.append(candidate)  # type: ignore[arg-type]
 
         content = FORMATS[options.format].export(project, packages, options)
         if options.output:

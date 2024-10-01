@@ -159,10 +159,11 @@ class BaseRemovePaths(abc.ABC):
         dist_location = os.path.dirname(meta_location)
         if is_egg_link(dist):  # pragma: no cover
             egg_link_path = cast("Path | None", getattr(dist, "link_file", None))
+            dist_name = dist.metadata.get("Name")
             if not egg_link_path:
                 termui.logger.warn(
                     "No egg link is found for editable distribution %s, do nothing.",
-                    dist.metadata["Name"],
+                    dist_name,
                 )
             else:
                 with egg_link_path.open("rb") as f:
@@ -170,7 +171,7 @@ class BaseRemovePaths(abc.ABC):
                 if link_pointer != dist_location:
                     raise UninstallError(
                         f"The link pointer in {egg_link_path} doesn't match "
-                        f"the location of {dist.metadata['Name']}(at {dist_location}"
+                        f"the location of {dist_name} (at {dist_location}"
                     )
                 instance.add_path(str(egg_link_path))
                 instance.add_pth(link_pointer)
@@ -178,7 +179,7 @@ class BaseRemovePaths(abc.ABC):
             for file in dist.files:
                 location = dist.locate_file(file)
                 instance.add_path(str(location))
-                bare_name, ext = os.path.splitext(location)
+                bare_name, ext = os.path.splitext(cast(Path, location))
                 if ext == ".py":
                     # .pyc files are added by add_path()
                     instance.add_path(bare_name + ".pyo")

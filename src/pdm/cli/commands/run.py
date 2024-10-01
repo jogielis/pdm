@@ -9,7 +9,6 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
-from types import FrameType
 from typing import TYPE_CHECKING, Mapping, NamedTuple, Sequence, cast
 
 from rich import print_json
@@ -20,12 +19,15 @@ from pdm.cli.hooks import HookManager
 from pdm.cli.options import skip_option, venv_option
 from pdm.cli.utils import check_project_file
 from pdm.exceptions import PdmUsageError
-from pdm.project import Project
 from pdm.signals import pdm_signals
-from pdm.utils import expand_env_vars, is_path_relative_to
+from pdm.utils import deprecation_warning, expand_env_vars, is_path_relative_to
 
 if TYPE_CHECKING:
+    from types import FrameType
     from typing import Any, Callable, Iterator, TypedDict
+
+    from pdm.environments import BaseEnvironment
+    from pdm.project import Project
 
     class EnvFileOptions(TypedDict, total=True):
         override: str
@@ -39,11 +41,18 @@ if TYPE_CHECKING:
         working_dir: str
 
 
-def exec_opts(*options: TaskOptions | None) -> dict[str, Any]:
-    return dict(
-        env={k: v for opts in options if opts for k, v in opts.get("env", {}).items()} or None,
-        **{k: v for opts in options if opts for k, v in opts.items() if k not in ("env", "help")},
+def merge_options(*options: TaskOptions | None) -> TaskOptions:
+    """Merge multiple options dicts. For the same key, the last one wins."""
+    return cast(
+        "TaskOptions",
+        {
+            "env": {k: v for opts in options if opts for k, v in opts.get("env", {}).items()},
+            **{k: v for opts in options if opts for k, v in opts.items() if k not in ("env", "help", "keep_going")},
+        },
     )
+
+
+exec_opts = merge_options  # Alias for merge_options
 
 
 RE_ARGS_PLACEHOLDER = re.compile(r"\{args(?::(?P<default>[^}]*))?\}")
@@ -77,6 +86,29 @@ def interpolate(script: str, args: Sequence[str]) -> tuple[str, bool]:
     script, args_interpolated = _interpolate_args(script, args)
     script = _interpolate_pdm(script)
     return script, args_interpolated
+
+
+_METADATA_REGEX = r"(?m)^# /// (?P<type>[a-zA-Z0-9-]+)$\s(?P<content>(^#(| .*)$\s)+)^# ///$"
+
+
+def read_script_metadata(script: str, section: str) -> dict[str, Any] | None:
+    # Adapted from https://packaging.python.org/en/latest/specifications/inline-script-metadata/
+    if sys.version_info >= (3, 11):
+        import tomllib
+    else:
+        import tomli as tomllib
+
+    matches = [m for m in re.finditer(_METADATA_REGEX, script) if m.group("type") == section]
+    if len(matches) > 1:
+        raise ValueError(f"Multiple {section} blocks found")
+    elif len(matches) == 1:
+        content = "".join(
+            line[2:] if line.startswith("# ") else line[1:]
+            for line in matches[0].group("content").splitlines(keepends=True)
+        )
+        return tomllib.loads(content)
+    else:
+        return None
 
 
 class Task(NamedTuple):
@@ -114,9 +146,41 @@ class TaskRunner:
             self.project.scripts.get("_", {}) if self.project.scripts else {},
         )
         self.global_options = global_options.copy()
+        self.recreate_env = False
         self.hooks = hooks
 
+    def _get_script_env(self, script_file: str) -> BaseEnvironment:
+        import hashlib
+
+        from pdm.cli.commands.venv.backends import BACKENDS
+        from pdm.environments import PythonEnvironment
+        from pdm.installers.core import install_requirements
+        from pdm.models.venv import get_venv_python
+
+        with open(script_file, encoding="utf8") as f:
+            metadata = read_script_metadata(f.read(), "script")
+        if not metadata:
+            return self.project.environment
+        tool_config = metadata.pop("tool", {})
+        script_project = self.project.core.create_project()
+        script_project.pyproject.set_data({"project": metadata, "tool": tool_config})
+        venv_name = hashlib.md5(os.path.realpath(script_file).encode("utf-8")).hexdigest()
+        venv_backend = BACKENDS[script_project.config["venv.backend"]](script_project, None)
+        venv = venv_backend.get_location(None, venv_name)
+        if venv.exists() and not self.recreate_env:
+            self.project.core.ui.info(f"Reusing existing script environment: {venv}", verbosity=termui.Verbosity.DETAIL)
+        else:
+            self.project.core.ui.info(f"Creating environment for script: {venv}", verbosity=termui.Verbosity.DETAIL)
+            venv = venv_backend.create(venv_name=venv_name, force=True)
+        env = PythonEnvironment(script_project, python=get_venv_python(venv).as_posix())
+        script_project._python = env.interpreter
+        env.project = script_project  # keep a strong reference to the project
+        if reqs := script_project.get_dependencies():
+            install_requirements(reqs, env, clean=True)
+        return env
+
     def get_task(self, script_name: str) -> Task | None:
+        """Get the task with the given name. Return None if not found."""
         if script_name not in self.project.scripts:
             return None
         script = cast("str | Sequence[str] | Mapping[str,Any]", self.project.scripts[script_name])
@@ -140,14 +204,14 @@ class TaskRunner:
             raise PdmUsageError(f"Unknown options for task {script_name}: {', '.join(unknown_options)}")
         return Task(kind, script_name, value, cast("TaskOptions", options))
 
-    def expand_command(self, command: str) -> str:
+    def expand_command(self, env: BaseEnvironment, command: str) -> str:
         expanded_command = os.path.expanduser(command)
         if expanded_command.replace(os.sep, "/").startswith(("./", "../")):
             abspath = os.path.abspath(expanded_command)
             if not os.path.isfile(abspath):
                 raise PdmUsageError(f"Command [success]'{command}'[/] is not a valid executable.")
             return abspath
-        result = self.project.environment.which(command)
+        result = env.which(command)
         if not result:
             raise PdmUsageError(f"Command [success]'{command}'[/] is not found in your PATH.")
         return result
@@ -163,8 +227,17 @@ class TaskRunner:
         working_dir: str | None = None,
     ) -> int:
         """Run command in a subprocess and return the exit code."""
+        import dotenv
+        from dotenv.main import resolve_variables
+
         project = self.project
-        process_env = os.environ.copy()
+        if not shell and args[0].endswith(".py"):
+            project_env = self._get_script_env(os.path.expanduser(args[0]))
+        else:
+            check_project_file(project)
+            project_env = project.environment
+        this_path = project_env.get_paths()["scripts"]
+        os.environ.update(project_env.process_env)
         if env_file is not None:
             if isinstance(env_file, str):
                 path = env_file
@@ -173,34 +246,25 @@ class TaskRunner:
                 path = env_file["override"]
                 override = True
 
-            import dotenv
-
             project.core.ui.echo(
                 f"Loading .env file: [success]{env_file}[/]",
                 err=True,
                 verbosity=termui.Verbosity.DETAIL,
             )
-            dotenv_env = dotenv.dotenv_values(project.root / path, encoding="utf-8")
-            if override:
-                process_env = {**process_env, **dotenv_env}
-            else:
-                process_env = {**dotenv_env, **process_env}
-        project_env = project.environment
-        this_path = project_env.get_paths()["scripts"]
-        process_env.update(project_env.process_env)
+            dotenv.load_dotenv(self.project.root / path, override=override)
         if env:
-            process_env.update(env)
+            os.environ.update(resolve_variables(env.items(), override=True))
         if shell:
             assert isinstance(args, str)
             # environment variables will be expanded by shell
             process_cmd: str | Sequence[str] = args
         else:
             assert isinstance(args, Sequence)
-            command, *args = (expand_env_vars(arg, env=process_env) for arg in args)
+            command, *args = (expand_env_vars(arg) for arg in args)
             if command.endswith(".py"):
                 args = [command, *args]
-                command = str(project.environment.interpreter.executable)
-            expanded_command = self.expand_command(command)
+                command = str(project_env.interpreter.executable)
+            expanded_command = self.expand_command(project_env, command)
             real_command = os.path.realpath(expanded_command)
             process_cmd = [expanded_command, *args]
             if (
@@ -213,7 +277,7 @@ class TaskRunner:
             ):
                 # The executable belongs to the local packages directory.
                 # Don't load system site-packages
-                process_env["NO_SITE_PACKAGES"] = "1"
+                os.environ["NO_SITE_PACKAGES"] = "1"
 
         cwd = (project.root / working_dir) if working_dir else project.root if chdir else None
 
@@ -224,13 +288,23 @@ class TaskRunner:
 
         handle_term = signal.signal(signal.SIGTERM, forward_signal)
         handle_int = signal.signal(signal.SIGINT, forward_signal)
-        process = subprocess.Popen(process_cmd, cwd=cwd, env=process_env, shell=shell, bufsize=0)
+        process = subprocess.Popen(process_cmd, cwd=cwd, shell=shell, bufsize=0)
         process.wait()
         signal.signal(signal.SIGTERM, handle_term)
         signal.signal(signal.SIGINT, handle_int)
         return process.returncode
 
-    def run_task(self, task: Task, args: Sequence[str] = (), opts: TaskOptions | None = None) -> int:
+    def run_task(
+        self, task: Task, args: Sequence[str] = (), opts: TaskOptions | None = None, seen: set[str] | None = None
+    ) -> int:
+        """Run the named task with the given arguments.
+
+        Args:
+            task: The task to run
+            args: The extra arguments passed to the task
+            opts: The options passed from parent if any
+            seen: The set of seen tasks to prevent recursive calls
+        """
         kind, _, value, options = task
         shell = False
         if kind == "cmd":
@@ -281,26 +355,41 @@ class TaskRunner:
                 split = shlex.split(script)
                 cmd = split[0]
                 subargs = split[1:] + ([] if should_interpolate else args)
-                code = self.run(cmd, subargs, options, chdir=True)
+                code = self.run(cmd, subargs, merge_options(options, opts), chdir=True, seen=seen)
                 if code != 0:
                     if not keep_going:
                         return code
                     composite_code = code
             return composite_code
-        return self._run_process(args, chdir=True, shell=shell, **exec_opts(self.global_options, options, opts))
+        return self._run_process(args, chdir=True, shell=shell, **merge_options(self.global_options, options, opts))  # type: ignore[misc]
 
-    def run(self, command: str, args: list[str], opts: TaskOptions | None = None, chdir: bool = False) -> int:
+    def run(
+        self,
+        command: str,
+        args: list[str],
+        opts: TaskOptions | None = None,
+        chdir: bool = False,
+        seen: set[str] | None = None,
+    ) -> int:
+        """Run a command or script with the given arguments."""
         if command in self.hooks.skip:
             return 0
+        if seen is None:
+            seen = set()
         task = self.get_task(command)
         if task is not None:
+            if task.kind == "composite":
+                if command in seen:
+                    raise PdmUsageError(f"Script {command} is recursive.")
+                seen = {command, *seen}
+
             self.hooks.try_emit("pre_script", script=command, args=args)
             pre_task = self.get_task(f"pre_{command}")
             if pre_task is not None and self.hooks.should_run(pre_task.name):
                 code = self.run_task(pre_task, opts=opts)
                 if code != 0:
                     return code
-            code = self.run_task(task, args, opts=opts)
+            code = self.run_task(task, args, opts=opts, seen=seen)
             if code != 0:
                 return code
             post_task = self.get_task(f"post_{command}")
@@ -309,7 +398,7 @@ class TaskRunner:
             self.hooks.try_emit("post_script", script=command, args=args)
             return code
         else:
-            return self._run_process([command, *args], chdir=chdir, **exec_opts(self.global_options, opts))
+            return self._run_process([command, *args], chdir=chdir, **merge_options(self.global_options, opts))  # type: ignore[misc]
 
     def show_list(self) -> None:
         if not self.project.scripts:
@@ -361,7 +450,6 @@ def _fix_env_file(data: dict[str, Any]) -> dict[str, Any]:
 class Command(BaseCommand):
     """Run commands or scripts with local packages loaded"""
 
-    runner_cls: type[TaskRunner] = TaskRunner
     arguments = (*BaseCommand.arguments, skip_option, venv_option)
 
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:
@@ -385,6 +473,9 @@ class Command(BaseCommand):
             action="store_true",
             help="Load site-packages from the selected interpreter",
         )
+        exec.add_argument(
+            "--recreate", action="store_true", help="Recreate the script environment for self-contained scripts"
+        )
         exec.add_argument("script", nargs="?", help="The command to run")
         exec.add_argument(
             "args",
@@ -392,16 +483,24 @@ class Command(BaseCommand):
             help="Arguments that will be passed to the command",
         )
 
+    def get_runner(self, project: Project, hooks: HookManager, options: argparse.Namespace) -> TaskRunner:
+        if (runner_cls := getattr(self, "runner_cls", None)) is not None:  # pragma: no cover
+            deprecation_warning("runner_cls attribute is deprecated, use get_runner method instead.")
+            runner = cast("type[TaskRunner]", runner_cls)(project, hooks)
+        else:
+            runner = TaskRunner(project, hooks)
+        runner.recreate_env = options.recreate
+        if options.site_packages:
+            runner.global_options["site_packages"] = True
+        return runner
+
     def handle(self, project: Project, options: argparse.Namespace) -> None:
-        check_project_file(project)
         hooks = HookManager(project, options.skip)
-        runner = self.runner_cls(project, hooks=hooks)
+        runner = self.get_runner(project, hooks, options)
         if options.list:
             return runner.show_list()
         if options.json:
             return print_json(data=runner.as_json())
-        if options.site_packages:
-            runner.global_options.update({"site_packages": options.site_packages})
         if not options.script:
             project.core.ui.warn("No command is given, default to the Python REPL.")
             options.script = "python"

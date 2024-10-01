@@ -4,7 +4,6 @@ from pathlib import Path
 import pytest
 
 from pdm.cli import actions
-from pdm.models.requirements import parse_requirement
 from pdm.utils import cd
 from tests import FIXTURES
 
@@ -119,12 +118,12 @@ def test_import_other_format_file(project, pdm, filename):
 
 
 def test_import_requirement_no_overwrite(project, pdm, tmp_path):
-    project.add_dependencies({"requests": parse_requirement("requests")})
+    project.add_dependencies(["requests"])
     tmp_path.joinpath("reqs.txt").write_text("flask\nflask-login\n")
     result = pdm(["import", "-dGweb", str(tmp_path.joinpath("reqs.txt"))], obj=project)
     assert result.exit_code == 0, result.stderr
-    assert list(project.get_dependencies()) == ["requests"]
-    assert list(project.get_dependencies("web")) == ["flask", "flask-login"]
+    assert [r.key for r in project.get_dependencies()] == ["requests"]
+    assert [r.key for r in project.get_dependencies("web")] == ["flask", "flask-login"]
 
 
 @pytest.mark.network
@@ -176,10 +175,16 @@ def test_export_to_requirements_txt(pdm, fixture_project):
     assert result.output.strip() == requirements_txt.read_text().strip()
 
     result = pdm(["export", "--self"], obj=project)
+    assert result.exit_code == 1
+
+    result = pdm(["export", "--editable-self"], obj=project)
+    assert result.exit_code == 1
+
+    result = pdm(["export", "--no-hashes", "--self"], obj=project)
     assert result.exit_code == 0
     assert ".  # this package\n" in result.output.strip()
 
-    result = pdm(["export", "--editable-self"], obj=project)
+    result = pdm(["export", "--no-hashes", "--editable-self"], obj=project)
     assert result.exit_code == 0
     assert "-e .  # this package\n" in result.output.strip()
 
@@ -196,13 +201,16 @@ def test_export_to_requirements_txt(pdm, fixture_project):
     assert (project.root / "requirements_output.txt").read_text() == requirements_txt.read_text()
 
 
-def test_export_doesnt_include_dep_with_extras(pdm, fixture_project):
+@pytest.mark.parametrize("extra_opt", [[], ["--no-extras"]])
+def test_export_doesnt_include_dep_with_extras(pdm, fixture_project, extra_opt):
     project = fixture_project("demo-package-has-dep-with-extras")
-    requirements_txt = project.root / "requirements.txt"
 
-    result = pdm(["export", "--without-hashes"], obj=project)
+    result = pdm(["export", "--without-hashes", *extra_opt], obj=project)
     assert result.exit_code == 0
-    assert result.output.strip() == requirements_txt.read_text().strip()
+    if extra_opt:
+        assert "requests==2.26.0" in result.output.splitlines()
+    else:
+        assert "requests[security]==2.26.0" in result.output.splitlines()
 
 
 def test_completion_command(pdm):
@@ -226,9 +234,28 @@ def test_show_update_hint(pdm, project, monkeypatch):
 
 @pytest.mark.usefixtures("repository")
 def test_export_with_platform_markers(pdm, project):
-    pdm(["add", "--no-sync", 'urllib3; sys_platform == "fake"'], obj=project, strict=True)
-    result = pdm(["export"], obj=project, strict=True)
-    assert 'urllib3==1.22; sys_platform == "fake"' in result.output.splitlines()
+    pdm(
+        ["add", "--no-sync", 'urllib3; sys_platform == "fake"', 'idna; python_version >= "3.7"'],
+        obj=project,
+        strict=True,
+    )
+    result = pdm(["export", "--no-hashes"], obj=project, strict=True)
+    result_lines = result.output.splitlines()
+    assert 'urllib3==1.22; sys_platform == "fake"' in result_lines
+    assert 'idna==2.7; python_version >= "3.7"' in result_lines
 
-    result = pdm(["export", "--no-markers"], obj=project, strict=True)
-    assert not any("urllib3" in line for line in result.output.splitlines())
+    result = pdm(["export", "--no-hashes", "--no-markers"], obj=project, strict=True)
+    result_lines = result.output.splitlines()
+    assert not any(line.startswith("urllib3") for line in result_lines)
+    assert "idna==2.7" in result_lines
+
+
+@pytest.mark.usefixtures("repository", "vcs")
+def test_export_with_vcs_deps(pdm, project):
+    pdm(["add", "--no-sync", "git+https://github.com/test-root/demo.git"], obj=project, strict=True)
+    result = pdm(["export"], obj=project)
+    assert result.exit_code != 0
+
+    result = pdm(["export", "--no-hashes"], obj=project)
+    assert result.exit_code == 0
+    assert "demo @ git+https://github.com/test-root/demo.git@1234567890abcdef" in result.output.splitlines()

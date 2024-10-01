@@ -2,28 +2,31 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import operator
 import os
 import re
 import shutil
 import sys
-from functools import cached_property
+from functools import cached_property, reduce
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, cast
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Sequence, cast
 
 import tomlkit
+from pbs_installer import PythonVersion
 from tomlkit.items import Array
 
-from pdm import termui
-from pdm._types import RepositoryConfig
+from pdm._types import NotSet, NotSetType, RepositoryConfig
+from pdm.compat import CompatibleSequence
 from pdm.exceptions import NoPythonVersion, PdmUsageError, ProjectError
-from pdm.models.backends import BuildBackend, get_backend_by_spec
+from pdm.models.backends import DEFAULT_BACKEND, BuildBackend, get_backend_by_spec
 from pdm.models.caches import PackageCache
+from pdm.models.markers import EnvSpec
 from pdm.models.python import PythonInfo
 from pdm.models.repositories import BaseRepository, LockedRepository
-from pdm.models.requirements import Requirement, parse_requirement, strip_extras
+from pdm.models.requirements import Requirement, parse_line, parse_requirement, strip_extras
 from pdm.models.specifiers import PySpecSet
-from pdm.project.config import Config
-from pdm.project.lockfile import Lockfile
+from pdm.project.config import Config, ensure_boolean
+from pdm.project.lockfile import FLAG_INHERIT_METADATA, Lockfile
 from pdm.project.project_file import PyProject
 from pdm.utils import (
     cd,
@@ -31,21 +34,25 @@ from pdm.utils import (
     expand_env_vars_in_auth,
     find_project_root,
     find_python_in_path,
+    get_all_installable_python_versions,
+    get_class_init_params,
     is_conda_base,
     is_conda_base_python,
+    is_path_relative_to,
     path_to_url,
 )
 
 if TYPE_CHECKING:
     from findpython import Finder
-    from resolvelib.reporters import BaseReporter
 
-    from pdm._types import Spinner
     from pdm.core import Core
     from pdm.environments import BaseEnvironment
+    from pdm.installers.base import BaseSynchronizer
     from pdm.models.caches import CandidateInfoCache, HashCache, WheelCache
     from pdm.models.candidates import Candidate
+    from pdm.resolver.base import Resolver
     from pdm.resolver.providers import BaseProvider
+    from pdm.resolver.reporters import RichLockReporter
 
 
 PYENV_ROOT = os.path.expanduser(os.getenv("PYENV_ROOT", "~/.pyenv"))
@@ -110,6 +117,10 @@ class Project:
         return f"<Project '{self.root.as_posix()}'>"
 
     @cached_property
+    def cache_dir(self) -> Path:
+        return Path(self.config.get("cache_dir", "")).expanduser()
+
+    @cached_property
     def pyproject(self) -> PyProject:
         return PyProject(self.root / self.PYPROJECT_FILENAME, ui=self.core.ui)
 
@@ -117,6 +128,10 @@ class Project:
     def lockfile(self) -> Lockfile:
         if self._lockfile is None:
             self._lockfile = Lockfile(self.root / self.LOCKFILE_FILENAME, ui=self.core.ui)
+            if self.config.get("use_uv"):
+                self._lockfile.default_strategies.discard(FLAG_INHERIT_METADATA)
+            if not self.config["strategy.inherit_metadata"]:
+                self._lockfile.default_strategies.discard(FLAG_INHERIT_METADATA)
         return self._lockfile
 
     def set_lockfile(self, path: str | Path) -> None:
@@ -202,9 +217,14 @@ class Project:
             if not self.is_global:
                 self.core.ui.info(message)
 
+        def is_active_venv(python: PythonInfo) -> bool:
+            if not (venv := os.getenv("VIRTUAL_ENV", os.getenv("CONDA_PREFIX"))):
+                return False
+            return is_path_relative_to(python.executable, venv)
+
         config = self.config
         saved_path = self._saved_python
-        if saved_path and not os.getenv("PDM_IGNORE_SAVED_PYTHON"):
+        if saved_path and not ensure_boolean(os.getenv("PDM_IGNORE_SAVED_PYTHON")):
             python = PythonInfo.from_path(saved_path)
             if match_version(python):
                 return python
@@ -215,11 +235,12 @@ class Project:
                 )
             self._saved_python = None  # Clear the saved path if it doesn't match
 
-        if config.get("python.use_venv") and not self.is_global and not os.getenv("PDM_IGNORE_ACTIVE_VENV"):
+        if config.get("python.use_venv") and not self.is_global:
             # Resolve virtual environments from env-vars
+            ignore_active_venv = ensure_boolean(os.getenv("PDM_IGNORE_ACTIVE_VENV"))
             venv_in_env = os.getenv("VIRTUAL_ENV", os.getenv("CONDA_PREFIX"))
             # We don't auto reuse conda's base env since it may cause breakage when removing packages.
-            if venv_in_env and not is_conda_base():
+            if not ignore_active_venv and venv_in_env and not is_conda_base():
                 python = PythonInfo.from_path(get_venv_python(Path(venv_in_env)))
                 if match_version(python):
                     note(
@@ -230,7 +251,7 @@ class Project:
             # otherwise, get a venv associated with the project
             for _, venv in iter_venvs(self):
                 python = PythonInfo.from_path(venv.interpreter)
-                if match_version(python):
+                if match_version(python) and not (ignore_active_venv and is_active_venv(python)):
                     note(f"Virtualenv [success]{venv.root}[/] is reused.")
                     self.python = python
                     return python
@@ -245,10 +266,9 @@ class Project:
                 self.python = PythonInfo.from_path(get_venv_python(venv_path))
                 return self.python
 
-        for py_version in self.find_interpreters():
-            if match_version(py_version):
-                if config.get("python.use_venv"):
-                    note("[success]__pypackages__[/] is detected, using the PEP 582 mode")
+        if self.root.joinpath("__pypackages__").exists() or not config["python.use_venv"] or self.is_global:
+            for py_version in self.iter_interpreters(filter_func=match_version):
+                note("[success]__pypackages__[/] is detected, using the PEP 582 mode")
                 self.python = py_version
                 return py_version
 
@@ -272,11 +292,13 @@ class Project:
             else PythonLocalEnvironment(self)
         )
 
-    def _create_virtualenv(self) -> Path:
+    def _create_virtualenv(self, python: str | None = None) -> Path:
         from pdm.cli.commands.venv.backends import BACKENDS
 
         backend: str = self.config["venv.backend"]
-        venv_backend = BACKENDS[backend](self, None)
+        if backend == "virtualenv" and self.config["use_uv"]:
+            backend = "uv"
+        venv_backend = BACKENDS[backend](self, python)
         path = venv_backend.create(
             force=True,
             in_project=self.config["venv.in_project"],
@@ -293,14 +315,14 @@ class Project:
         return self._environment
 
     @environment.setter
-    def environment(self, value: BaseEnvironment) -> None:
+    def environment(self, value: BaseEnvironment | None) -> None:
         self._environment = value
 
     @property
     def python_requires(self) -> PySpecSet:
         return PySpecSet(self.pyproject.metadata.get("requires-python", ""))
 
-    def get_dependencies(self, group: str | None = None) -> dict[str, Requirement]:
+    def get_dependencies(self, group: str | None = None) -> Sequence[Requirement]:
         metadata = self.pyproject.metadata
         group = group or "default"
         optional_dependencies = metadata.get("optional-dependencies", {})
@@ -320,24 +342,21 @@ class Project:
                 deps = dev_dependencies[group]
             else:
                 raise PdmUsageError(f"Non-exist group {group}")
-        result = {}
+        result = []
         with cd(self.root):
             for line in deps:
-                if line.startswith("-e "):
-                    if in_metadata:
-                        self.core.ui.warn(
-                            f"Skipping editable dependency [b]{line}[/] in the"
-                            r" [success]\[project][/] table. Please move it to the "
-                            r"[success]\[tool.pdm.dev-dependencies][/] table"
-                        )
-                        continue
-                    req = parse_requirement(line[3:].strip(), True)
-                else:
-                    req = parse_requirement(line)
+                if line.startswith("-e ") and in_metadata:
+                    self.core.ui.warn(
+                        f"Skipping editable dependency [b]{line}[/] in the"
+                        r" [success]\[project][/] table. Please move it to the "
+                        r"[success]\[tool.pdm.dev-dependencies][/] table"
+                    )
+                    continue
+                req = parse_line(line)
                 req.groups = [group]
                 # make editable packages behind normal ones to override correctly.
-                result[req.identify()] = req
-        return result
+                result.append(req)
+        return CompatibleSequence(result)
 
     def iter_groups(self) -> Iterable[str]:
         groups = {"default"}
@@ -348,7 +367,7 @@ class Project:
         return groups
 
     @property
-    def all_dependencies(self) -> dict[str, dict[str, Requirement]]:
+    def all_dependencies(self) -> dict[str, Sequence[Requirement]]:
         return {group: self.get_dependencies(group) for group in self.iter_groups()}
 
     @property
@@ -361,10 +380,16 @@ class Project:
             verify_ssl=self.config["pypi.verify_ssl"],
             username=self.config.get("pypi.username"),
             password=self.config.get("pypi.password"),
+            ca_certs=self.config.get("pypi.ca_certs"),
+            client_cert=self.config.get("pypi.client_cert"),
+            client_key=self.config.get("pypi.client_key"),
         )
 
     @property
     def sources(self) -> list[RepositoryConfig]:
+        return self.get_sources(include_stored=not self.config.get("pypi.ignore_stored_index", False))
+
+    def get_sources(self, expand_env: bool = True, include_stored: bool = False) -> list[RepositoryConfig]:
         result: dict[str, RepositoryConfig] = {}
         for source in self.pyproject.settings.get("source", []):
             result[source["name"]] = RepositoryConfig(**source, config_prefix="pypi")
@@ -374,49 +399,64 @@ class Project:
                 name = source.name
                 if name in result:
                     result[name].passive_update(source)
-                else:
+                elif include_stored:
                     result[name] = source
 
-        if not self.config.get("pypi.ignore_stored_index", False):
-            if "pypi" not in result:  # put pypi source at the beginning
-                result = {"pypi": self.default_source, **result}
-            else:
-                result["pypi"].passive_update(self.default_source)
-            merge_sources(self.project_config.iter_sources())
-            merge_sources(self.global_config.iter_sources())
+        merge_sources(self.project_config.iter_sources())
+        merge_sources(self.global_config.iter_sources())
+        if "pypi" in result:
+            result["pypi"].passive_update(self.default_source)
+        elif include_stored:
+            # put pypi source at the beginning
+            result = {"pypi": self.default_source, **result}
+
         sources: list[RepositoryConfig] = []
         for source in result.values():
             if not source.url:
                 continue
-            source.url = expand_env_vars_in_auth(source.url)
+            if expand_env:
+                source.url = DEFAULT_BACKEND(self.root).expand_line(expand_env_vars_in_auth(source.url))
             sources.append(source)
         return sources
 
     def get_repository(
-        self, cls: type[BaseRepository] | None = None, ignore_compatibility: bool = True
+        self,
+        cls: type[BaseRepository] | None = None,
+        ignore_compatibility: bool | NotSetType = NotSet,
+        env_spec: EnvSpec | None = None,
     ) -> BaseRepository:
         """Get the repository object"""
         if cls is None:
             cls = self.core.repository_class
         sources = self.sources or []
-        return cls(sources, self.environment, ignore_compatibility=ignore_compatibility)
+        params = get_class_init_params(cls)
+        if "env_spec" in params:
+            return cls(sources, self.environment, env_spec=env_spec)
+        else:
+            return cls(sources, self.environment, ignore_compatibility=ignore_compatibility)
 
-    @property
-    def locked_repository(self) -> LockedRepository:
+    def get_locked_repository(self, env_spec: EnvSpec | None = None) -> LockedRepository:
         try:
             lockfile = self.lockfile._data.unwrap()
         except ProjectError:
             lockfile = {}
 
-        return LockedRepository(lockfile, self.sources, self.environment)
+        return LockedRepository(lockfile, self.sources, self.environment, env_spec=env_spec)
+
+    @property
+    def locked_repository(self) -> LockedRepository:
+        deprecation_warning("Project.locked_repository is deprecated, use Project.get_locked_repository() instead", 2)
+        return self.get_locked_repository()
 
     def get_provider(
         self,
         strategy: str = "all",
         tracked_names: Iterable[str] | None = None,
         for_install: bool = False,
-        ignore_compatibility: bool = True,
+        ignore_compatibility: bool | NotSetType = NotSet,
         direct_minimal_versions: bool = False,
+        env_spec: EnvSpec | None = None,
+        locked_repository: LockedRepository | None = None,
     ) -> BaseProvider:
         """Build a provider class for resolver.
 
@@ -428,49 +468,39 @@ class Project:
         :returns: The provider object
         """
 
-        from pdm.resolver.providers import BaseProvider, get_provider, provider_arguments
+        import inspect
 
-        repository = self.get_repository(ignore_compatibility=ignore_compatibility)
-        locked_repository: LockedRepository | None = None
-        try:
-            locked_repository = self.locked_repository
-        except Exception:  # pragma: no cover
-            if for_install:
-                raise
-            if strategy != "all":
-                self.core.ui.warn("Unable to reuse the lock file as it is not compatible with PDM")
+        from pdm.resolver.providers import get_provider
 
-        if for_install:
-            assert locked_repository is not None
-            return BaseProvider(
-                locked_repository, direct_minimal_versions=direct_minimal_versions, locked_candidates={}
+        if env_spec is None:
+            env_spec = (
+                self.environment.allow_all_spec if ignore_compatibility in (True, NotSet) else self.environment.spec
             )
+        repo_params = inspect.signature(self.get_repository).parameters
+        if "env_spec" in repo_params:
+            repository = self.get_repository(env_spec=env_spec)
+        else:  # pragma: no cover
+            repository = self.get_repository(ignore_compatibility=ignore_compatibility)
+        if locked_repository is None:
+            try:
+                locked_repository = self.get_locked_repository(env_spec)
+            except Exception:  # pragma: no cover
+                if strategy != "all":
+                    self.core.ui.warn("Unable to reuse the lock file as it is not compatible with PDM")
+
         provider_class = get_provider(strategy)
         params: dict[str, Any] = {}
         if strategy != "all":
             params["tracked_names"] = [strip_extras(name)[0] for name in tracked_names or ()]
-        locked_candidates = {} if locked_repository is None else locked_repository.all_candidates
-        accepted_args = provider_arguments(provider_class)
-        if "locked_candidates" in accepted_args:
-            params["locked_candidates"] = locked_candidates
-        elif "preferred_pins" in accepted_args:  # pragma: no cover
-            deprecation_warning(
-                "`preferred_pins` has been moved to keyword-only argument `locked_candidates`", stacklevel=1
-            )
-            params["preferred_pins"] = locked_candidates
-        else:  # pragma: no cover
-            deprecation_warning(
-                "Missing `locked_candidates` argument from the provider class, it will be populated automatically",
-                stacklevel=1,
-            )
+        locked_candidates: dict[str, list[Candidate]] = (
+            {} if locked_repository is None else locked_repository.all_candidates
+        )
+        params["locked_candidates"] = locked_candidates
         return provider_class(repository=repository, direct_minimal_versions=direct_minimal_versions, **params)
 
     def get_reporter(
-        self,
-        requirements: list[Requirement],
-        tracked_names: Iterable[str] | None = None,
-        spinner: Spinner | None = None,
-    ) -> BaseReporter:
+        self, requirements: list[Requirement], tracked_names: Iterable[str] | None = None
+    ) -> RichLockReporter:  # pragma: no cover
         """Return the reporter object to construct a resolver.
 
         :param requirements: requirements to resolve
@@ -478,12 +508,9 @@ class Project:
         :param spinner: optional spinner object
         :returns: a reporter
         """
-        from pdm.resolver.reporters import SpinnerReporter
+        from pdm.resolver.reporters import RichLockReporter
 
-        if spinner is None:
-            spinner = termui.SilentSpinner("")
-
-        return SpinnerReporter(spinner, requirements)
+        return RichLockReporter(requirements, self.core.ui)
 
     def get_lock_metadata(self) -> dict[str, Any]:
         content_hash = "sha256:" + self.pyproject.content_hash("sha256")
@@ -530,7 +557,10 @@ class Project:
         def update_dev_dependencies(deps: list[str]) -> None:
             from tomlkit.container import OutOfOrderTableProxy
 
-            settings.setdefault("dev-dependencies", {})[group] = deps
+            if deps:
+                settings.setdefault("dev-dependencies", {})[group] = deps
+            else:
+                settings.setdefault("dev-dependencies", {}).pop(group, None)
             if isinstance(self.pyproject._data["tool"], OutOfOrderTableProxy):
                 # In case of a separate table, we have to remove and re-add it to make the write correct.
                 # This may change the order of tables in the TOML file, but it's the best we can do.
@@ -544,7 +574,9 @@ class Project:
         deps_setter = [
             (
                 metadata.get("optional-dependencies", {}),
-                lambda x: metadata.setdefault("optional-dependencies", {}).__setitem__(group, x),
+                lambda x: metadata.setdefault("optional-dependencies", {}).__setitem__(group, x)
+                if x
+                else metadata.setdefault("optional-dependencies", {}).pop(group, None),
             ),
             (settings.get("dev-dependencies", {}), update_dev_dependencies),
         ]
@@ -556,24 +588,46 @@ class Project:
 
     def add_dependencies(
         self,
-        requirements: dict[str, Requirement],
+        requirements: Iterable[str | Requirement],
         to_group: str = "default",
         dev: bool = False,
         show_message: bool = True,
-    ) -> None:
-        deps, setter = self.use_pyproject_dependencies(to_group, dev)
-        for _, dep in requirements.items():
-            matched_index = next(
-                (i for i, r in enumerate(deps) if dep.matches(r)),
-                None,
+        write: bool = True,
+    ) -> list[Requirement]:
+        """Add requirements to the given group, and return the requirements of that group."""
+        if isinstance(requirements, Mapping):  # pragma: no cover
+            deprecation_warning(
+                "Passing a requirements map to add_dependencies is deprecated, " "please pass an iterable", stacklevel=2
             )
-            req = dep.as_line()
-            if matched_index is None:
-                deps.append(req)
-            else:
-                deps[matched_index] = req
+            requirements = requirements.values()
+        deps, setter = self.use_pyproject_dependencies(to_group, dev)
+        updated_indices: set[int] = set()
+
+        with cd(self.root):
+            parsed_deps = [parse_line(dep) for dep in deps]
+
+            for req in requirements:
+                if isinstance(req, str):
+                    req = parse_line(req)
+                matched_index = next(
+                    (i for i, r in enumerate(deps) if req.matches(r) and i not in updated_indices),
+                    None,
+                )
+                dep = req.as_line()
+                if matched_index is None:
+                    updated_indices.add(len(deps))
+                    deps.append(dep)
+                    parsed_deps.append(req)
+                else:
+                    deps[matched_index] = dep
+                    parsed_deps[matched_index] = req
+                    updated_indices.add(matched_index)
         setter(cast(Array, deps).multiline(True))
-        self.pyproject.write(show_message)
+        if write:
+            self.pyproject.write(show_message)
+        for r in parsed_deps:
+            r.groups = [to_group]
+        return parsed_deps
 
     def init_global_project(self) -> None:
         if not self.is_global or not self.pyproject.empty():
@@ -585,16 +639,6 @@ class Project:
     @property
     def backend(self) -> BuildBackend:
         return get_backend_by_spec(self.pyproject.build_system)(self.root)
-
-    @property
-    def cache_dir(self) -> Path:
-        if self._cache_dir is None:
-            self._cache_dir = Path(self.config.get("cache_dir", "")).expanduser()
-        return self._cache_dir
-
-    @cache_dir.setter
-    def cache_dir(self, value: Path) -> None:
-        self._cache_dir = value
 
     def cache(self, name: str) -> Path:
         path = self.cache_dir / name
@@ -615,16 +659,56 @@ class Project:
         return PackageCache(self.cache("packages"))
 
     def make_candidate_info_cache(self) -> CandidateInfoCache:
-        from pdm.models.caches import CandidateInfoCache
+        from pdm.models.caches import CandidateInfoCache, EmptyCandidateInfoCache
 
         python_hash = hashlib.sha1(str(self.environment.python_requires).encode()).hexdigest()
         file_name = f"package_meta_{python_hash}.json"
-        return CandidateInfoCache(self.cache("metadata") / file_name)
+        return (
+            CandidateInfoCache(self.cache("metadata") / file_name)
+            if self.core.state.enable_cache
+            else EmptyCandidateInfoCache(self.cache("metadata") / file_name)
+        )
 
     def make_hash_cache(self) -> HashCache:
-        from pdm.models.caches import HashCache
+        from pdm.models.caches import EmptyHashCache, HashCache
 
-        return HashCache(directory=self.cache("hashes"))
+        return HashCache(self.cache("hashes")) if self.core.state.enable_cache else EmptyHashCache(self.cache("hashes"))
+
+    def iter_interpreters(
+        self,
+        python_spec: str | None = None,
+        search_venv: bool | None = None,
+        filter_func: Callable[[PythonInfo], bool] | None = None,
+    ) -> Iterable[PythonInfo]:
+        """Iterate over all interpreters that matches the given specifier.
+        And optionally install the interpreter if not found.
+        """
+        from pdm.cli.commands.python import InstallCommand
+
+        found = False
+        for interpreter in self.find_interpreters(python_spec, search_venv):
+            if filter_func is None or filter_func(interpreter):
+                found = True
+                yield interpreter
+        if found or self.is_global:
+            return
+
+        if not python_spec:  # handle both empty string and None
+            # Get the best match meeting the requires-python
+            best_match = self.get_best_matching_cpython_version()
+            if best_match is None:
+                return
+            python_spec = str(best_match)
+
+        try:
+            # otherwise if no interpreter is found, try to install it
+            installed = InstallCommand.install_python(self, python_spec)
+        except Exception as e:
+            self.core.ui.error(f"Failed to install Python {python_spec}: {e}")
+            return
+        else:
+            if filter_func is None or filter_func(installed):
+                yield installed
 
     def find_interpreters(
         self, python_spec: str | None = None, search_venv: bool | None = None
@@ -667,7 +751,7 @@ class Project:
                         return
             finder_arg = python_spec
         if search_venv is None:
-            search_venv = config["python.use_venv"]
+            search_venv = cast(bool, config["python.use_venv"])
         finder = self._get_python_finder(search_venv)
         for entry in finder.find_all(finder_arg, allow_prereleases=True):
             yield PythonInfo(entry)
@@ -682,9 +766,22 @@ class Project:
         from pdm.cli.commands.venv.utils import VenvProvider
 
         providers: list[str] = self.config["python.providers"]
-        finder = Finder(resolve_symlinks=True, selected_providers=providers or None)
-        if search_venv and (not providers or "venv" in providers):
-            venv_pos = providers.index("venv") if providers else 0
+        venv_pos = -1
+        if not providers:
+            venv_pos = 0
+        elif "venv" in providers:
+            venv_pos = providers.index("venv")
+            providers.remove("venv")
+        old_rye_root = os.getenv("RYE_PY_ROOT")
+        os.environ["RYE_PY_ROOT"] = os.path.expanduser(self.config["python.install_root"])
+        try:
+            finder = Finder(resolve_symlinks=True, selected_providers=providers or None)
+        finally:
+            if old_rye_root:  # pragma: no cover
+                os.environ["RYE_PY_ROOT"] = old_rye_root
+            else:
+                del os.environ["RYE_PY_ROOT"]
+        if search_venv and venv_pos >= 0:
             finder.add_provider(VenvProvider(self), venv_pos)
         return finder
 
@@ -696,6 +793,73 @@ class Project:
         if "package-type" in settings:
             return settings["package-type"] == "library"
         elif "distribution" in settings:
-            return settings["distribution"]
+            return cast(bool, settings["distribution"])
         else:
             return True
+
+    def get_setting(self, key: str) -> Any:
+        """
+        Get a setting from its dotted key (without the `tool.pdm` prefix).
+
+        Returns `None` if the key does not exists.
+        """
+        try:
+            return reduce(operator.getitem, key.split("."), self.pyproject.settings)
+        except KeyError:
+            return None
+
+    def env_or_setting(self, var: str, key: str) -> Any:
+        """
+        Get a value from environment variable and fallback on a given setting.
+
+        Returns `None` if both the environment variable and the key does not exists.
+        """
+        return os.getenv(var.upper()) or self.get_setting(key)
+
+    def get_best_matching_cpython_version(self, use_minimum: bool | None = False) -> PythonVersion | None:
+        """
+        Returns the best matching cPython version that fits requires-python, this platform and arch.
+        If no best match could be found, return None.
+
+        Default for best match strategy is "highest" possible interpreter version. If "minimum" shall be used,
+        set `use_minimum` to True.
+        """
+
+        def get_version(version: PythonVersion) -> str:
+            return f"{version.major}.{version.minor}.{version.micro}"
+
+        all_matches = get_all_installable_python_versions(build_dir=False)
+        filtered_matches = [
+            v for v in all_matches if get_version(v) in self.python_requires and v.implementation.lower() == "cpython"
+        ]
+        if filtered_matches:
+            if use_minimum:
+                return min(filtered_matches, key=lambda v: (v.major, v.minor, v.micro))
+            return max(filtered_matches, key=lambda v: (v.major, v.minor, v.micro))
+
+        return None
+
+    @property
+    def lock_targets(self) -> list[EnvSpec]:
+        return [self.environment.allow_all_spec]
+
+    def get_resolver(self) -> type[Resolver]:
+        """Get the resolver class to use for the project."""
+        from pdm.resolver.resolvelib import RLResolver
+        from pdm.resolver.uv import UvResolver
+
+        if self.config.get("use_uv"):
+            return UvResolver
+        else:
+            return RLResolver
+
+    def get_synchronizer(self, quiet: bool = False) -> type[BaseSynchronizer]:
+        """Get the synchronizer class to use for the project."""
+        from pdm.installers import BaseSynchronizer, Synchronizer, UvSynchronizer
+        from pdm.installers.uv import QuietUvSynchronizer
+
+        if self.config.get("use_uv"):
+            return QuietUvSynchronizer if quiet else UvSynchronizer
+        if quiet:
+            return BaseSynchronizer
+        return getattr(self.core, "synchronizer_class", Synchronizer)

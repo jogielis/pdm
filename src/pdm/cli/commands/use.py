@@ -9,19 +9,32 @@ from pdm.cli.options import skip_option
 from pdm.exceptions import NoPythonVersion
 from pdm.models.caches import JSONFileCache
 from pdm.models.python import PythonInfo
+from pdm.models.venv import get_venv_python
 from pdm.project import Project
+from pdm.utils import is_conda_base_python
 
 
 class Command(BaseCommand):
-    """Use the given python version or path as base interpreter"""
+    """Use the given python version or path as base interpreter. If not found, PDM will try to install one."""
 
     def add_arguments(self, parser: argparse.ArgumentParser) -> None:
         skip_option.add_to_parser(parser)
-        parser.add_argument(
+        unattended_use_group = parser.add_mutually_exclusive_group()
+        unattended_use_group.add_argument(
             "-f",
             "--first",
             action="store_true",
-            help="Select the first matched interpreter",
+            help="Select the first matched interpreter - no auto install",
+        )
+        unattended_use_group.add_argument(
+            "--auto-install-min",
+            action="store_true",
+            help="If `python` argument not given, auto install minimal best match - otherwise has no effect",
+        )
+        unattended_use_group.add_argument(
+            "--auto-install-max",
+            action="store_true",
+            help="If `python` argument not given, auto install maximum best match - otherwise has no effect",
         )
         parser.add_argument(
             "-i",
@@ -41,7 +54,10 @@ class Command(BaseCommand):
         ignore_requires_python: bool,
         venv: str | None,
         first: bool,
+        auto_install_min: bool,
+        auto_install_max: bool,
     ) -> PythonInfo:
+        from pdm.cli.commands.python import InstallCommand
         from pdm.cli.commands.venv.utils import get_venv_with_name
 
         def version_matcher(py_version: PythonInfo) -> bool:
@@ -68,32 +84,45 @@ class Command(BaseCommand):
                 project.core.ui.info("Using the last selection, add '-i' to ignore it.")
                 return cached_python
 
-        found_interpreters = list(dict.fromkeys(project.find_interpreters(python)))
-        matching_interpreters = list(filter(version_matcher, found_interpreters))
-        if not found_interpreters:
-            raise NoPythonVersion(f"No Python interpreter matching [success]{python}[/] is found.")
-        if not matching_interpreters:
-            project.core.ui.echo("Interpreters found but not matching:", err=True)
-            for py in found_interpreters:
-                info = py.identifier if py.valid else "Invalid"
-                project.core.ui.echo(f"  - {py.path} ({info})", err=True)
-            raise NoPythonVersion(
-                f"No python is found meeting the requirement [success]python {project.python_requires!s}[/]"
-            )
-        if first or len(matching_interpreters) == 1:
-            return matching_interpreters[0]
+        if not python and not first and (auto_install_min or auto_install_max):
+            match = project.get_best_matching_cpython_version(auto_install_min)
+            if match is None:
+                req = f'requires-python="{project.python_requires}"'
+                raise NoPythonVersion(
+                    f"No Python interpreter matching [success]{req}[/] is found based on 'auto-install' strategy."
+                )
+            try:
+                installed_interpreter_to_use = InstallCommand.install_python(project, str(match))
+            except Exception as e:
+                project.core.ui.error(f"Failed to install Python {python}: {e}")
+                project.core.ui.info("Please select a Python interpreter manually")
+            else:
+                return installed_interpreter_to_use
 
-        project.core.ui.echo("Please enter the Python interpreter to use")
-        for i, py_version in enumerate(matching_interpreters):
-            project.core.ui.echo(f"{i}. [success]{py_version.path!s}[/] ({py_version.identifier})")
+        found_interpreters = list(dict.fromkeys(project.iter_interpreters(python, filter_func=version_matcher)))
+        if not found_interpreters:
+            req = python if ignore_requires_python else f'requires-python="{project.python_requires}"'
+            raise NoPythonVersion(f"No Python interpreter matching [success]{req}[/] is found.")
+
+        if first or len(found_interpreters) == 1 or not termui.is_interactive():
+            project.core.ui.info("Using the first matched interpreter.")
+            return found_interpreters[0]
+
+        project.core.ui.echo(
+            f"Please enter the {'[bold]Global[/] ' if project.is_global else ''}Python interpreter to use"
+        )
+        for i, py_version in enumerate(found_interpreters):
+            project.core.ui.echo(
+                f"{i:>2}. [success]{py_version.implementation}@{py_version.identifier}[/] ({py_version.path!s})"
+            )
         selection = termui.ask(
             "Please select",
             default="0",
             prompt_type=int,
-            choices=[str(i) for i in range(len(matching_interpreters))],
+            choices=[str(i) for i in range(len(found_interpreters))],
             show_choices=False,
         )
-        return matching_interpreters[int(selection)]
+        return found_interpreters[int(selection)]
 
     def do_use(
         self,
@@ -104,12 +133,14 @@ class Command(BaseCommand):
         ignore_requires_python: bool = False,
         save: bool = True,
         venv: str | None = None,
+        auto_install_min: bool = False,
+        auto_install_max: bool = False,
         hooks: HookManager | None = None,
     ) -> PythonInfo:
         """Use the specified python version and save in project config.
         The python can be a version string or interpreter path.
         """
-        from pdm.environments.local import PythonLocalEnvironment
+        from pdm.environments import PythonLocalEnvironment
 
         selected_python = self.select_python(
             project,
@@ -118,33 +149,41 @@ class Command(BaseCommand):
             first=first,
             venv=venv,
             ignore_requires_python=ignore_requires_python,
+            auto_install_min=auto_install_min,
+            auto_install_max=auto_install_max,
         )
+        # NOTE: PythonInfo is cached with path as key.
+        # This can lead to inconsistency when the same virtual environment is reused.
+        # So the original python identifier is preserved here for logging purpose.
+        selected_python_identifier = selected_python.identifier
         if python:
             use_cache: JSONFileCache[str, str] = JSONFileCache(project.cache_dir / "use_cache.json")
             use_cache.set(python, selected_python.path.as_posix())
 
+        if project.config["python.use_venv"] and (
+            selected_python.get_venv() is None or is_conda_base_python(selected_python.path)
+        ):
+            venv_path = project._create_virtualenv(str(selected_python.path))
+            selected_python = PythonInfo.from_path(get_venv_python(venv_path))
         if not save:
             return selected_python
 
         saved_python = project._saved_python
         old_python = PythonInfo.from_path(saved_python) if saved_python else None
         project.core.ui.echo(
-            f"Using Python interpreter: [success]{selected_python.path!s}[/] ({selected_python.identifier})"
+            f"Using {'[bold]Global[/] ' if project.is_global else ''}Python interpreter: [success]{selected_python.path!s}[/] ({selected_python_identifier})"
         )
         project.python = selected_python
         if project.environment.is_local:
+            assert isinstance(project.environment, PythonLocalEnvironment)
             project.core.ui.echo(
                 "Using __pypackages__ because non-venv Python is used.",
                 style="primary",
                 err=True,
             )
-        if (
-            old_python
-            and old_python.executable != selected_python.executable
-            and isinstance(project.environment, PythonLocalEnvironment)
-        ):
-            project.core.ui.echo("Updating executable scripts...", style="primary")
-            project.environment.update_shebangs(selected_python.executable.as_posix())
+            if old_python and old_python.executable != selected_python.executable:
+                project.core.ui.echo("Updating executable scripts...", style="primary")
+                project.environment.update_shebangs(selected_python.executable.as_posix())
 
         hooks = hooks or HookManager(project)
         hooks.try_emit("post_use", python=selected_python)
@@ -157,5 +196,7 @@ class Command(BaseCommand):
             first=options.first,
             ignore_remembered=options.ignore_remembered,
             venv=options.venv,
+            auto_install_min=options.auto_install_min,
+            auto_install_max=options.auto_install_max,
             hooks=HookManager(project, options.skip),
         )

@@ -10,7 +10,7 @@ import pytest
 from pdm import termui
 from pdm.cli import actions
 from pdm.cli.utils import get_pep582_path
-from pdm.utils import cd
+from pdm.utils import cd, path_to_url
 
 
 @pytest.fixture
@@ -640,7 +640,15 @@ def test_composite_inherit_env(project, pdm, capfd, _echo):
             "cmd": "python echo.py Second VAR",
             "env": {"VAR": "42"},
         },
-        "test": {"composite": ["first", "second"], "env": {"VAR": "overriden"}},
+        "nested": {
+            "composite": ["third"],
+            "env": {"VAR": "42"},
+        },
+        "third": {
+            "cmd": "python echo.py Third VAR",
+            "env": {"VAR": "42"},
+        },
+        "test": {"composite": ["first", "second", "nested"], "env": {"VAR": "overriden"}},
     }
     project.pyproject.write()
     capfd.readouterr()
@@ -648,6 +656,7 @@ def test_composite_inherit_env(project, pdm, capfd, _echo):
     out, _ = capfd.readouterr()
     assert "First CALLED with VAR=overriden" in out
     assert "Second CALLED with VAR=overriden" in out
+    assert "Third CALLED with VAR=overriden" in out
 
 
 def test_composite_fail_on_first_missing_task(project, pdm, capfd, _echo):
@@ -663,6 +672,30 @@ def test_composite_fail_on_first_missing_task(project, pdm, capfd, _echo):
     out, _ = capfd.readouterr()
     assert "First CALLED" in out
     assert "Second CALLED" not in out
+
+
+def test_composite_fails_on_recursive_script(project, pdm):
+    project.pyproject.settings["scripts"] = {
+        "first": {"composite": ["first"]},
+        "second": {"composite": ["third"]},
+        "third": {"composite": ["second"]},
+        "fourth": {"composite": ["python -V", "python -V"]},
+        "fifth": {"composite": ["fourth", "fourth"]},
+    }
+    project.pyproject.write()
+    result = pdm(["run", "first"], obj=project)
+    assert result.exit_code == 1
+    assert "Script first is recursive" in result.stderr
+
+    result = pdm(["run", "second"], obj=project)
+    assert result.exit_code == 1
+    assert "Script second is recursive" in result.stderr
+
+    result = pdm(["run", "fourth"], obj=project)
+    assert result.exit_code == 0
+
+    result = pdm(["run", "fifth"], obj=project)
+    assert result.exit_code == 0
 
 
 def test_composite_runs_all_hooks(project, pdm, capfd, _echo):
@@ -833,6 +866,19 @@ def test_composite_inherit_dotfile(project, pdm, capfd, _echo):
     assert "Post-Task CALLED with VAR=overriden" in out
 
 
+def test_resolve_env_vars_in_dotfile(project, pdm, capfd, _echo):
+    (project.root / ".env").write_text("VAR=42\nFOO=${OUT}/${VAR}")
+    project.pyproject.settings["scripts"] = {
+        "_": {"env_file": ".env"},
+        "test": {"cmd": "python echo.py Task FOO BAR", "env": {"BAR": "${FOO}/bar"}},
+    }
+    project.pyproject.write()
+    capfd.readouterr()
+    pdm(["run", "test"], strict=True, obj=project, env={"OUT": "hello"})
+    out, _ = capfd.readouterr()
+    assert "Task CALLED with FOO=hello/42 BAR=hello/42/bar" in out
+
+
 def test_composite_can_have_commands(project, pdm, capfd):
     project.pyproject.settings["scripts"] = {
         "task": {"cmd": ["python", "-c", 'print("Task CALLED")']},
@@ -912,3 +958,40 @@ def test_run_script_changing_working_dir(project, pdm, capfd):
     capfd.readouterr()
     pdm(["run", "test_script"], obj=project, strict=True)
     assert capfd.readouterr()[0].strip() == "Hello world"
+
+
+def test_run_script_with_inline_metadata(project, pdm, local_finder, local_finder_artifacts):
+    with cd(project.root):
+        project.root.joinpath("test_script.py").write_text(
+            textwrap.dedent("""\
+            from first import first
+
+            assert first([0, False, 1, 2]) == 1
+            """)
+        )
+        result = pdm(["run", "test_script.py"], obj=project)
+        assert result.exit_code != 0
+
+    local_artifacts_url = path_to_url(str(local_finder_artifacts))
+
+    project.root.joinpath("test_script.py").write_text(
+        textwrap.dedent(f"""\
+        # /// script
+        # requires-python = ">=3.8"
+        # dependencies = [
+        #   "first",
+        # ]
+        #
+        # [[tool.pdm.source]]
+        # name = "pypi"
+        # url = "{local_artifacts_url}"
+        # type = "find_links"
+        # ///
+        from first import first
+
+        assert first([0, False, 1, 2]) == 1
+        """)
+    )
+    with cd(project.root):
+        result = pdm(["run", "test_script.py"], obj=project)
+        assert result.exit_code == 0

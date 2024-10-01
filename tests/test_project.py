@@ -4,9 +4,10 @@ import os
 import sys
 import venv
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
-from packaging.version import parse
+from pbs_installer import PythonVersion
 from pytest_httpserver import HTTPServer
 
 from pdm.environments import PythonEnvironment
@@ -14,7 +15,21 @@ from pdm.exceptions import PdmException
 from pdm.models.requirements import parse_requirement
 from pdm.models.specifiers import PySpecSet
 from pdm.models.venv import get_venv_python
-from pdm.utils import cd
+from pdm.utils import cd, is_path_relative_to, parse_version
+
+if TYPE_CHECKING:
+    from pdm.project.core import Project
+    from pdm.pytest import PDMCallable
+
+PYTHON_VERSIONS = ["3.8.7", "3.10.12", "3.10.11", "3.8.0", "3.10.13", "3.9.12"]
+
+
+def get_python_versions() -> list[PythonVersion]:
+    python_versions = []
+    for v in PYTHON_VERSIONS:
+        major, minor, micro = v.split(".")
+        python_versions.append(PythonVersion("cpython", int(major), int(minor), int(micro)))
+    return python_versions
 
 
 def test_project_python_with_pyenv_support(project, mocker, monkeypatch):
@@ -29,7 +44,7 @@ def test_project_python_with_pyenv_support(project, mocker, monkeypatch):
     pyenv_python.touch()
     mocker.patch(
         "findpython.python.PythonVersion._get_version",
-        return_value=parse("3.8.0"),
+        return_value=parse_version("3.8.0"),
     )
     mocker.patch("findpython.python.PythonVersion._get_interpreter", return_value=sys.executable)
     assert Path(project.python.path) == pyenv_python
@@ -169,10 +184,10 @@ def test_select_dependencies(project):
         "test": ["pytest"],
         "doc": ["mkdocs"],
     }
-    assert sorted(project.get_dependencies()) == ["requests"]
+    assert sorted([r.key for r in project.get_dependencies()]) == ["requests"]
 
-    assert sorted(project.get_dependencies("security")) == ["cryptography"]
-    assert sorted(project.get_dependencies("test")) == ["pytest"]
+    assert sorted([r.key for r in project.get_dependencies("security")]) == ["cryptography"]
+    assert sorted([r.key for r in project.get_dependencies("test")]) == ["pytest"]
 
     assert sorted(project.iter_groups()) == [
         "default",
@@ -292,10 +307,9 @@ def test_access_index_with_auth(project, httpserver: HTTPServer):
             "pypi.extra.password": "bar",
         }
     )
-    with project.environment.get_finder() as finder:
-        session = finder.session
-        resp = session.get(httpserver.url_for("/simple/my-package"))
-        assert resp.ok
+    session = project.environment.session
+    resp = session.get(httpserver.url_for("/simple/my-package"))
+    assert resp.is_success
 
 
 def test_configured_source_overwriting(project):
@@ -332,6 +346,10 @@ def test_invoke_pdm_adding_configured_args(project, pdm, mocker):
     parser.assert_called_with(["install", "--no-self", "--no-editable", "--check"])
     pdm(["lock", "--lockfile", "pdm.2.lock"], obj=project)
     parser.assert_called_with(["lock", "--no-cross-platform", "--lockfile", "pdm.2.lock"])
+    pdm(["-c", "/dev/null", "lock"], obj=project)
+    parser.assert_called_with(["-c", "/dev/null", "lock", "--no-cross-platform"])
+    pdm(["--verbose", "add", "requests"], obj=project)
+    parser.assert_called_with(["--verbose", "add", "--no-isolation", "requests"])
 
 
 @pytest.fixture()
@@ -339,8 +357,8 @@ def prepare_repository(repository, project):
     repository.add_candidate("foo", "3.0", ">=3.8,<3.13")
     repository.add_candidate("foo", "2.0", ">=3.7,<3.12")
     repository.add_candidate("foo", "1.0", ">=3.7")
-    repository.environment.python_requires = PySpecSet(">=3.9")
-    project.add_dependencies({"foo": parse_requirement("foo")})
+    project.environment.python_requires = PySpecSet(">=3.9")
+    project.add_dependencies(["foo"])
 
 
 @pytest.mark.usefixtures("prepare_repository")
@@ -354,7 +372,7 @@ def test_quiet_mode(pdm, project, is_quiet, extra_args, recwarn):
     assert 'For example, "<3.13,>=3.9"' in str(recwarn[0].message)
     assert 'For example, "<3.12,>=3.9"' in str(recwarn[1].message)
     assert ("to suppress these warnings" in result.stderr) is not is_quiet
-    assert project.locked_repository.all_candidates["foo"].version == "1.0"
+    assert project.get_locked_repository().candidates["foo"].version == "1.0"
 
 
 @pytest.mark.usefixtures("prepare_repository")
@@ -380,7 +398,7 @@ def test_filter_sources_with_config(project):
     ]
     repository = project.get_repository()
 
-    def expect_sources(requirement: str, expected: list[str]) -> bool:
+    def expect_sources(requirement: str, expected: list[str]) -> None:
         sources = repository.get_filtered_sources(parse_requirement(requirement))
         assert sorted([source.name for source in sources]) == sorted(expected)
 
@@ -397,8 +415,120 @@ def test_preserve_log_file(project, pdm, tmp_path, mocker):
     all_logs = list(tmp_path.joinpath("logs").iterdir())
     assert len(all_logs) == 0
 
-    mocker.patch.object(project.core.synchronizer_class, "synchronize", side_effect=Exception)
+    mocker.patch("pdm.installers.Synchronizer.synchronize", side_effect=Exception)
     result = pdm(["add", "pytz"], obj=project)
     assert result.exit_code != 0
     install_log = next(tmp_path.joinpath("logs").glob("pdm-install-*.log"))
     assert install_log.exists()
+
+
+@pytest.mark.parametrize("use_venv", [True, False])
+def test_find_interpreters_with_PDM_IGNORE_ACTIVE_VENV(
+    pdm: PDMCallable,
+    project: Project,
+    monkeypatch: pytest.MonkeyPatch,
+    use_venv: bool,
+):
+    project._saved_python = None
+    project._python = None
+    project.project_config["python.use_venv"] = use_venv
+    venv.create(venv_path := project.root / "venv", symlinks=True)
+    monkeypatch.setenv("VIRTUAL_ENV", str(venv_path))
+    monkeypatch.setenv("PDM_IGNORE_ACTIVE_VENV", "1")
+
+    venv_python = get_venv_python(venv_path)
+    pythons = list(project.find_interpreters())
+
+    assert pythons, "PDM should find interpreters with PDM_IGNORE_ACTIVE_VENV"
+    # Test requires that some interpreters are available outside the venv
+    assert any(venv_python != p.executable for p in project.find_interpreters())
+    # No need to assert, exception raised if not found
+    interpreter = project.resolve_interpreter()
+    assert interpreter.executable != venv_python
+
+    if use_venv:
+        project.project_config["venv.in_project"] = True
+        pdm("install", strict=True, obj=project)
+        assert project._saved_python
+        python = Path(project._saved_python)
+        assert is_path_relative_to(python, project.root)
+        assert not is_path_relative_to(python, venv_path)
+
+
+@pytest.mark.parametrize(
+    "var,key,settings,expected",
+    [
+        ("PDM_VAR", "var", {}, "from-env"),
+        ("pdm_var", "var", {}, "from-env"),
+        ("PDM_NOPE", "var", {"var": "from-settings"}, "from-settings"),
+        ("PDM_VAR", "var", {"var": "from-settings"}, "from-env"),
+        ("PDM_NOPE", "nested.var", {"nested": {"var": "from-settings"}}, "from-settings"),
+        ("PDM_NOPE", "noop", {}, None),
+    ],
+)
+def test_env_or_setting(
+    project: Project,
+    monkeypatch: pytest.MonkeyPatch,
+    var: str,
+    key: str,
+    settings: dict,
+    expected: str | None,
+):
+    monkeypatch.setenv("PDM_VAR", "from-env")
+    project.pyproject.settings.update(settings)
+
+    assert project.env_or_setting(var, key) == expected
+
+
+@pytest.mark.parametrize(
+    "var,setting,expected",
+    [
+        (None, None, []),
+        ("", None, []),
+        (" ", None, []),
+        (None, "", []),
+        (None, " ", []),
+        (None, [], []),
+        ("var", None, ["var"]),
+        ("val1,val2", None, ["val1", "val2"]),
+        ("val1, val2", None, ["val1", "val2"]),
+        ("val1, , , val2", None, ["val1", "val2"]),
+        (None, "val1,val2", ["val1", "val2"]),
+        (None, ["val1", "val2"], ["val1", "val2"]),
+        (None, [" val1", "val2 "], ["val1", "val2"]),
+        (None, [" val1", "", "val2 ", " "], ["val1", "val2"]),
+        (None, ["val1,val2", "val3,val4"], ["val1,val2", "val3,val4"]),
+        ("val1,val2", ["val3", "val4"], ["val1", "val2"]),
+    ],
+)
+def test_env_setting_list(
+    project: Project,
+    monkeypatch: pytest.MonkeyPatch,
+    var: str | None,
+    setting: str | list[str] | None,
+    expected: list[str],
+):
+    if var is not None:
+        monkeypatch.setenv("PDM_VAR", var)
+    if setting is not None:
+        project.pyproject.settings["var"] = setting
+
+    assert project.environment._setting_list("PDM_VAR", "var") == expected
+
+
+def test_project_best_match_max(project, mocker):
+    expected = PythonVersion("cpython", 3, 10, 13)
+    mocker.patch(
+        "pdm.project.core.get_all_installable_python_versions",
+        return_value=get_python_versions(),
+    )
+    assert project.get_best_matching_cpython_version() == expected
+
+
+def test_project_best_match_min(project, mocker):
+    expected = PythonVersion("cpython", 3, 8, 0)
+    mocker.patch(
+        "pdm.project.core.get_all_installable_python_versions",
+        return_value=get_python_versions(),
+    )
+    assert project.get_best_matching_cpython_version(use_minimum=True) == expected

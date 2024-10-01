@@ -40,7 +40,7 @@ class Command(BaseCommand):
         elif options.packages:
             project.core.ui.echo(str(packages_path))
         elif options.env:
-            project.core.ui.echo(json.dumps(project.environment.marker_environment, indent=2))
+            project.core.ui.echo(json.dumps(project.environment.spec.markers_with_defaults(), indent=2))
         elif options.json:
             print_json(
                 data={
@@ -48,7 +48,7 @@ class Command(BaseCommand):
                     "python": {
                         "interpreter": str(interpreter.executable),
                         "version": interpreter.identifier,
-                        "markers": project.environment.marker_environment,
+                        "markers": project.environment.spec.markers_with_defaults(),
                     },
                     "project": {
                         "root": str(project.root),
@@ -62,9 +62,9 @@ class Command(BaseCommand):
                     f"[primary]{key}[/]:"
                     for key in [
                         "PDM version",
-                        "Python Interpreter",
-                        "Project Root",
-                        "Local Packages",
+                        f"{'Global ' if project.is_global else ''}Python Interpreter",
+                        f"{'Global ' if project.is_global else ''}Project Root",
+                        f"{'Global ' if project.is_global else ''}Local Packages",
                     ]
                 ],
                 [

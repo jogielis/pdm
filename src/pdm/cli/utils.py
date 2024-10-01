@@ -6,8 +6,7 @@ import json
 import os
 import re
 import sys
-from collections import ChainMap, OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
 from fnmatch import fnmatch
 from gettext import gettext as _
 from json import dumps
@@ -23,22 +22,19 @@ from typing import (
     no_type_check,
 )
 
-import tomlkit
 from packaging.specifiers import SpecifierSet
 from resolvelib.structs import DirectedGraph
 from rich.tree import Tree
 
 from pdm import termui
 from pdm.exceptions import PdmArgumentError, ProjectError
+from pdm.models.markers import EnvSpec
 from pdm.models.requirements import (
-    FileRequirement,
     Requirement,
     filter_requirements_with_extras,
-    parse_requirement,
     strip_extras,
 )
 from pdm.models.specifiers import PySpecSet, get_specifier
-from pdm.project.lockfile import FLAG_CROSS_PLATFORM, FLAG_INHERIT_METADATA, FLAG_STATIC_URLS
 from pdm.utils import (
     comparable_version,
     is_path_relative_to,
@@ -55,7 +51,6 @@ if TYPE_CHECKING:
     from pdm.compat import Distribution
     from pdm.compat import importlib_metadata as im
     from pdm.models.candidates import Candidate
-    from pdm.models.repositories import BaseRepository
     from pdm.project import Project
 
 
@@ -179,7 +174,7 @@ class ErrorArgumentParser(ArgumentParser):
 
 
 @dc.dataclass(frozen=True)
-class Package:
+class PackageNode:
     """An internal class for the convenience of dependency graph building."""
 
     name: str = dc.field(hash=True, compare=True)
@@ -192,32 +187,29 @@ class Package:
 
 def build_dependency_graph(
     working_set: Mapping[str, im.Distribution],
-    marker_env: dict[str, str] | None = None,
+    env_spec: EnvSpec,
     selected: set[str] | None = None,
     include_sub: bool = True,
 ) -> DirectedGraph:
     """Build a dependency graph from locked result."""
-    graph: DirectedGraph[Package | None] = DirectedGraph()
+    graph: DirectedGraph[PackageNode | None] = DirectedGraph()
     graph.add(None)  # sentinel parent of top nodes.
     node_with_extras: set[str] = set()
 
-    def add_package(key: str, dist: Distribution | None) -> Package:
+    def add_package(key: str, dist: Distribution | None) -> PackageNode:
         name, extras = strip_extras(key)
         extras = extras or ()
         reqs: dict[str, Requirement] = {}
         if dist:
-            requirements = (
-                parse_requirement(r)
-                for r in filter_requirements_with_extras(dist.requires or [], extras, include_default=True)
-            )
+            requirements = filter_requirements_with_extras(dist.requires or [], extras, include_default=True)
             for req in requirements:
-                if not req.marker or req.marker.evaluate(marker_env):
+                if not req.marker or req.marker.matches(env_spec):
                     reqs[req.identify()] = req
             version: str | None = dist.version
         else:
             version = None
 
-        node = Package(key, version, reqs)
+        node = PackageNode(key, version, reqs)
         if node not in graph:
             if extras:
                 node_with_extras.add(name)
@@ -261,7 +253,7 @@ def specifier_from_requirement(requirement: Requirement) -> str:
 def add_package_to_tree(
     root: Tree,
     graph: DirectedGraph,
-    package: Package,
+    package: PackageNode,
     required: list[str],
     visited: frozenset[str] = frozenset(),
 ) -> None:
@@ -297,8 +289,8 @@ def add_package_to_tree(
 def add_package_to_reverse_tree(
     root: Tree,
     graph: DirectedGraph,
-    package: Package,
-    child: Package | None = None,
+    package: PackageNode,
+    child: PackageNode | None = None,
     requires: str = "",
     visited: frozenset[str] = frozenset(),
 ) -> None:
@@ -321,24 +313,24 @@ def add_package_to_reverse_tree(
 
     if package.name in visited:
         return
-    parents: list[Package] = sorted(filter(None, graph.iter_parents(package)), key=lambda p: p.name)
+    parents: list[PackageNode] = sorted(filter(None, graph.iter_parents(package)), key=lambda p: p.name)
     for parent in parents:
         requires = specifier_from_requirement(parent.requirements[package.name])
         add_package_to_reverse_tree(node, graph, parent, package, requires, visited=visited | {package.name})
     return
 
 
-def package_is_project(package: Package, project: Project) -> bool:
+def package_is_project(package: PackageNode, project: Project) -> bool:
     return project.is_distribution and package.name == normalize_name(project.name)
 
 
 def _format_forward_dependency_graph(
-    project: Project, graph: DirectedGraph[Package | None], patterns: list[str]
+    project: Project, graph: DirectedGraph[PackageNode | None], patterns: list[str]
 ) -> Tree:
     """Format dependency graph for output."""
     root = Tree("Dependencies", hide_root=True)
 
-    def find_package_to_add(package: Package) -> Package | None:
+    def find_package_to_add(package: PackageNode) -> PackageNode | None:
         if not patterns:
             return package
         to_check = [package]
@@ -349,7 +341,12 @@ def _format_forward_dependency_graph(
             to_check.extend(graph.iter_children(package))
         return None
 
-    all_dependencies = ChainMap(*project.all_dependencies.values())
+    all_dependencies = {
+        r.identify(): r
+        for deps in project.all_dependencies.values()
+        for r in deps
+        if not r.marker or r.marker.matches(project.environment.spec)
+    }
     top_level_dependencies = {find_package_to_add(node) for node in graph.iter_children(None) if node}
     for package in sorted((node for node in top_level_dependencies if node), key=lambda p: p.name):
         required: set[str] = set()
@@ -368,11 +365,11 @@ def _format_forward_dependency_graph(
 
 
 def _format_reverse_dependency_graph(
-    project: Project, graph: DirectedGraph[Package | None], patterns: list[str]
+    project: Project, graph: DirectedGraph[PackageNode | None], patterns: list[str]
 ) -> Tree:
     """Format reverse dependency graph for output."""
 
-    def find_package_to_add(package: Package) -> Package | None:
+    def find_package_to_add(package: PackageNode) -> PackageNode | None:
         if not patterns:
             return package
         to_check = [package]
@@ -393,18 +390,24 @@ def _format_reverse_dependency_graph(
 
 
 def build_forward_dependency_json_subtree(
-    root: Package,
+    root: PackageNode,
     project: Project,
-    graph: DirectedGraph[Package | None],
-    required_by: Package | None = None,
+    graph: DirectedGraph[PackageNode | None],
+    required_by: PackageNode | None = None,
     visited: frozenset[str] = frozenset(),
 ) -> dict:
     required: set[str] = set()
+    all_dependencies = {
+        r.identify(): r
+        for deps in project.all_dependencies.values()
+        for r in deps
+        if not r.marker or r.marker.matches(project.environment.spec)
+    }
     for parent in graph.iter_parents(root):
         if parent:
             r = specifier_from_requirement(parent.requirements[root.name])
         elif not package_is_project(root, project):
-            requirements = required_by.requirements if required_by else ChainMap(*project.all_dependencies.values())
+            requirements = required_by.requirements if required_by else all_dependencies
             if root.name in requirements:
                 r = specifier_from_requirement(requirements[root.name])
             else:
@@ -431,10 +434,10 @@ def build_forward_dependency_json_subtree(
 
 
 def build_reverse_dependency_json_subtree(
-    root: Package,
+    root: PackageNode,
     project: Project,
-    graph: DirectedGraph[Package | None],
-    requires: Package | None = None,
+    graph: DirectedGraph[PackageNode | None],
+    requires: PackageNode | None = None,
     visited: frozenset[str] = frozenset(),
 ) -> dict:
     parents = graph.iter_parents(root) if root.name not in visited else []
@@ -453,14 +456,14 @@ def build_reverse_dependency_json_subtree(
     )
 
 
-def package_match_patterns(package: Package, patterns: list[str]) -> bool:
+def package_match_patterns(package: PackageNode, patterns: list[str]) -> bool:
     return not patterns or any(fnmatch(package.name, pattern) for pattern in patterns)
 
 
 def build_dependency_json_tree(
-    project: Project, graph: DirectedGraph[Package | None], reverse: bool, patterns: list[str]
+    project: Project, graph: DirectedGraph[PackageNode | None], reverse: bool, patterns: list[str]
 ) -> list[dict]:
-    def find_package_to_add(package: Package) -> Package | None:
+    def find_package_to_add(package: PackageNode) -> PackageNode | None:
         if not patterns:
             return package
         to_check = [package]
@@ -474,7 +477,7 @@ def build_dependency_json_tree(
                 to_check.extend(graph.iter_children(package))
         return None
 
-    top_level_packages: Iterable[Package | None]
+    top_level_packages: Iterable[PackageNode | None]
     if reverse:
         top_level_packages = filter(lambda n: not list(graph.iter_children(n)), graph)  # leaf nodes
         build_dependency_json_subtree: Callable = build_reverse_dependency_json_subtree
@@ -490,7 +493,7 @@ def build_dependency_json_tree(
 
 def show_dependency_graph(
     project: Project,
-    graph: DirectedGraph[Package | None],
+    graph: DirectedGraph[PackageNode | None],
     reverse: bool = False,
     json: bool = False,
     patterns: list[str] | None = None,
@@ -514,73 +517,9 @@ def show_dependency_graph(
     echo(tree)
 
 
-def format_lockfile(
-    project: Project,
-    mapping: dict[str, Candidate],
-    fetched_dependencies: dict[tuple[str, str | None], list[Requirement]],
-    groups: list[str] | None,
-    strategy: set[str],
-) -> dict:
-    """Format lock file from a dict of resolved candidates, a mapping of dependencies
-    and a collection of package summaries.
-    """
-    from pdm.formats.base import make_array, make_inline_table
-
-    packages = tomlkit.aot()
-    backend = project.backend
-    for _k, v in sorted(mapping.items()):
-        base = tomlkit.table()
-        base.update(v.as_lockfile_entry(project.root))
-        base.add("summary", v.summary or "")
-        if FLAG_INHERIT_METADATA in strategy:
-            base.add("groups", v.req.groups)
-            if v.req.marker is not None:
-                base.add("marker", str(v.req.marker))
-        deps: list[str] = []
-        for r in fetched_dependencies[v.dep_key]:
-            # Try to convert to relative paths to make it portable
-            if isinstance(r, FileRequirement) and r.path and r.path.is_absolute():
-                try:
-                    r.path = Path(os.path.normpath(r.path)).relative_to(os.path.normpath(project.root))
-                    r.url = backend.relative_path_to_url(r.path.as_posix())
-                except ValueError:
-                    pass
-            deps.append(r.as_line())
-        if len(deps) > 0:
-            base.add("dependencies", make_array(sorted(deps), True))
-        if v.hashes:
-            collected = {}
-            for item in v.hashes:
-                if FLAG_STATIC_URLS in strategy:
-                    row = {"url": item["url"], "hash": item["hash"]}
-                else:
-                    row = {"file": item["file"], "hash": item["hash"]}
-                inline = make_inline_table(row)
-                # deduplicate and sort
-                collected[tuple(row.values())] = inline
-            if collected:
-                base.add("files", make_array([collected[k] for k in sorted(collected)], True))
-        packages.append(base)
-    doc = tomlkit.document()
-    metadata = tomlkit.table()
-    if groups is None:
-        groups = list(project.iter_groups())
-    metadata.update(
-        {
-            "groups": sorted(groups, key=lambda k: k != "default"),
-            "strategy": sorted(strategy),
-        }
-    )
-    metadata.pop(FLAG_STATIC_URLS, None)
-    metadata.pop(FLAG_CROSS_PLATFORM, None)
-    doc.add("metadata", metadata)
-    doc.add("package", packages)
-    return cast(dict, doc)
-
-
 def save_version_specifiers(
-    requirements: dict[str, dict[str, Requirement]],
-    resolved: dict[str, Candidate],
+    requirements: Iterable[Requirement],
+    resolved: dict[str, list[Candidate]],
     save_strategy: str,
 ) -> None:
     """Rewrite the version specifiers according to the resolved result and save strategy
@@ -590,23 +529,28 @@ def save_version_specifiers(
     :param save_strategy: compatible/wildcard/exact
     """
 
-    def candidate_version(c: Candidate) -> Version:
+    def candidate_version(candidates: list[Candidate]) -> Version | None:
+        if len(candidates) > 1:
+            return None
+        c = candidates[0]
         assert c.version is not None
         return comparable_version(c.version)
 
-    for reqs in requirements.values():
-        for name, r in reqs.items():
-            if r.is_named and not r.specifier and name in resolved:
-                if save_strategy == "exact":
-                    r.specifier = get_specifier(f"=={candidate_version(resolved[name])}")
-                elif save_strategy == "compatible":
-                    version = candidate_version(resolved[name])
-                    if version.is_prerelease or version.is_devrelease:
-                        r.specifier = get_specifier(f">={version},<{version.major + 1}")
-                    else:
-                        r.specifier = get_specifier(f"~={version.major}.{version.minor}")
-                elif save_strategy == "minimum":
-                    r.specifier = get_specifier(f">={candidate_version(resolved[name])}")
+    for r in requirements:
+        name = r.identify()
+        if r.is_named and not r.specifier and name in resolved:
+            version = candidate_version(resolved[name])
+            if version is None:
+                continue
+            if save_strategy == "exact":
+                r.specifier = get_specifier(f"=={version}")
+            elif save_strategy == "compatible":
+                if version.is_prerelease or version.is_devrelease:
+                    r.specifier = get_specifier(f">={version},<{version.major + 1}")
+                else:
+                    r.specifier = get_specifier(f"~={version.major}.{version.minor}")
+            elif save_strategy == "minimum":
+                r.specifier = get_specifier(f">={version}")
 
 
 def check_project_file(project: Project) -> None:
@@ -702,7 +646,7 @@ def format_resolution_impossible(err: ResolutionImpossible) -> str:
     result.extend(sorted(info_lines))
     result.append(
         "To fix this, you could loosen the dependency version constraints in "
-        "pyproject.toml. See https://pdm-project.org/latest/usage/dependency/"
+        "pyproject.toml. See https://pdm-project.org/en/latest/usage/lockfile/"
         "#solve-the-locking-failure for more details."
     )
     return "\n".join(result)
@@ -724,16 +668,6 @@ def merge_dictionary(target: MutableMapping[Any, Any], input: Mapping[Any, Any],
                 target[key].multiline(True)  # type: ignore[attr-defined]
         else:
             target[key] = value
-
-
-def fetch_hashes(repository: BaseRepository, mapping: Mapping[str, Candidate]) -> None:
-    """Fetch hashes for candidates in parallel"""
-
-    def do_fetch(candidate: Candidate) -> None:
-        candidate.hashes = repository.get_hashes(candidate)
-
-    with ThreadPoolExecutor() as executor:
-        executor.map(do_fetch, mapping.values())
 
 
 def is_pipx_installation() -> bool:
@@ -786,9 +720,6 @@ def use_venv(project: Project, name: str) -> None:
     project.environment = PythonEnvironment(project, python=str(venv.interpreter))
 
 
-def populate_requirement_names(req_mapping: dict[str, Requirement]) -> None:
-    # Update the requirement key if the name changed.
-    for key, req in list(req_mapping.items()):
-        if key and key.startswith(":empty:"):
-            req_mapping[req.identify()] = req
-            del req_mapping[key]
+def normalize_pattern(pattern: str) -> str:
+    """Normalize a pattern to a valid name for a package."""
+    return re.sub(r"[^A-Za-z0-9*?]+", "-", pattern).lower()

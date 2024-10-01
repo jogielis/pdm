@@ -25,6 +25,8 @@ class _RepositoryConfig:
     verify_ssl: bool | None = None
     type: str | None = None
     ca_certs: str | None = None
+    client_cert: str | None = None
+    client_key: str | None = None
     include_packages: list[str] = dc.field(default_factory=list)
     exclude_packages: list[str] = dc.field(default_factory=list)
 
@@ -86,17 +88,17 @@ RequirementDict = Union[str, Dict[str, Union[str, bool]]]
 CandidateInfo = Tuple[List[str], str, str]
 
 
-class Package(NamedTuple):
+class SearchResult(NamedTuple):
     name: str
     version: str
     summary: str
 
 
-SearchResult = List[Package]
+SearchResults = List[SearchResult]
 
 
 if TYPE_CHECKING:
-    from typing import TypedDict
+    from typing import Required, TypedDict
 
     class Comparable(Protocol):
         def __lt__(self, __other: Any) -> bool: ...
@@ -115,5 +117,12 @@ if TYPE_CHECKING:
 
     class FileHash(TypedDict, total=False):
         url: str
-        hash: str
+        hash: Required[str]
         file: str
+
+
+class NotSetType:
+    pass
+
+
+NotSet = NotSetType()

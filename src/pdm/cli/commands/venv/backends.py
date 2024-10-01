@@ -37,10 +37,16 @@ class Backend(abc.ABC):
             project_python = self.project._python
             if project_python:
                 return project_python
-        # disable venv provider temporarily
-        for py_version in self.project.find_interpreters(self.python, search_venv=False):
-            if self.python or py_version.valid and self.project.python_requires.contains(py_version.version, True):
-                return py_version
+
+        def match_func(py_version: PythonInfo) -> bool:
+            return (
+                bool(self.python)
+                or py_version.valid
+                and self.project.python_requires.contains(py_version.version, True)
+            )
+
+        for py_version in self.project.iter_interpreters(self.python, search_venv=False, filter_func=match_func):
+            return py_version
 
         python = f" {self.python}" if self.python else ""
         raise VirtualenvCreateError(f"Can't resolve python interpreter{python}")
@@ -78,10 +84,12 @@ class Backend(abc.ABC):
         if not force:
             raise VirtualenvCreateError(f"The location {location} is not empty, add --force to overwrite it.")
         if location.is_file():
-            self.project.core.ui.echo(f"Removing existing file {location}", err=True)
+            self.project.core.ui.info(f"Removing existing file {location}", verbosity=termui.Verbosity.DETAIL)
             location.unlink()
         else:
-            self.project.core.ui.echo(f"Cleaning existing target directory {location}", err=True)
+            self.project.core.ui.info(
+                f"Cleaning existing target directory {location}", verbosity=termui.Verbosity.DETAIL
+            )
             with os.scandir(location) as entries:
                 for entry in entries:
                     if entry.is_dir() and not entry.is_symlink():
@@ -89,11 +97,15 @@ class Backend(abc.ABC):
                     else:
                         os.remove(entry.path)
 
-    def get_location(self, name: str | None) -> Path:
+    def get_location(self, name: str | None = None, venv_name: str | None = None) -> Path:
+        if name and venv_name:
+            raise PdmUsageError("Cannot specify both name and venv_name")
         venv_parent = Path(self.project.config["venv.location"]).expanduser()
         if not venv_parent.is_dir():
             venv_parent.mkdir(exist_ok=True, parents=True)
-        return venv_parent / f"{get_venv_prefix(self.project)}{name or self.ident}"
+        if not venv_name:
+            venv_name = f"{get_venv_prefix(self.project)}{name or self.ident}"
+        return venv_parent / venv_name
 
     def create(
         self,
@@ -103,11 +115,12 @@ class Backend(abc.ABC):
         in_project: bool = False,
         prompt: str | None = None,
         with_pip: bool = False,
+        venv_name: str | None = None,
     ) -> Path:
         if in_project:
             location = self.project.root / ".venv"
         else:
-            location = self.get_location(name)
+            location = self.get_location(name, venv_name)
         args = (*self.pip_args(with_pip), *args)
         if prompt is not None:
             prompt = prompt.format(
@@ -156,6 +169,18 @@ class VenvBackend(VirtualenvBackend):
         self.subprocess_call(cmd)
 
 
+class UvBackend(VirtualenvBackend):
+    def pip_args(self, with_pip: bool) -> Iterable[str]:
+        if with_pip:
+            return ("--seed", "pip")
+        return ()
+
+    def perform_create(self, location: Path, args: tuple[str, ...], prompt: str | None = None) -> None:
+        prompt_option = (f"--prompt={prompt}",) if prompt else ()
+        cmd = [*self.project.core.uv_cmd, "venv", *prompt_option, *args, str(location)]
+        self.subprocess_call(cmd)
+
+
 class CondaBackend(Backend):
     @property
     def ident(self) -> str:
@@ -187,4 +212,5 @@ BACKENDS: Mapping[str, type[Backend]] = {
     "virtualenv": VirtualenvBackend,
     "venv": VenvBackend,
     "conda": CondaBackend,
+    "uv": UvBackend,
 }

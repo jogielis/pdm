@@ -4,7 +4,7 @@
 
 一个现代的 Python 包管理器，支持 PEP 最新标准。[English version README](README.md)
 
-![PDM logo](https://raw.githubusercontents.com/pdm-project/pdm/main/docs/docs/assets/logo_big.png)
+![PDM logo](https://raw.githubusercontents.com/pdm-project/pdm/main/docs/assets/logo_big.png)
 
 [![Docs](https://img.shields.io/badge/Docs-mkdocs-blue?style=for-the-badge)](https://pdm-project.org)
 [![Twitter Follow](https://img.shields.io/twitter/follow/pdm_project?label=get%20updates&logo=twitter&style=for-the-badge)](https://twitter.com/pdm_project)
@@ -14,7 +14,7 @@
 [![PyPI](https://img.shields.io/pypi/v/pdm?logo=python&logoColor=%23cccccc)](https://pypi.org/project/pdm)
 [![Packaging status](https://repology.org/badge/tiny-repos/pdm.svg)](https://repology.org/project/pdm/versions)
 [![Downloads](https://pepy.tech/badge/pdm/week)](https://pepy.tech/project/pdm)
-[![pdm-managed](https://img.shields.io/badge/pdm-managed-blueviolet)](https://pdm-project.org)
+[![pdm-managed](https://img.shields.io/endpoint?url=https%3A%2F%2Fcdn.jsdelivr.net%2Fgh%2Fpdm-project%2F.github%2Fbadge.json)](https://pdm-project.org)
 
 [![asciicast](https://asciinema.org/a/jnifN30pjfXbO9We2KqOdXEhB.svg)](https://asciinema.org/a/jnifN30pjfXbO9We2KqOdXEhB)
 
@@ -33,6 +33,7 @@ PDM 旨在成为下一代 Python 软件包管理工具。它最初是为个人�
 - 灵活且强大的插件系统
 - [PEP 621] 元数据格式
 - 功能强大的用户脚本
+- 支持从 [indygreg's python-build-standalone](https://github.com/indygreg/python-build-standalone) 安装 Python。
 - 像 [pnpm] 一样的中心化安装缓存，节省磁盘空间
 
 [pep 517]: https://www.python.org/dev/peps/pep-0517
@@ -79,7 +80,7 @@ curl -sSL https://pdm-project.org/install-pdm.py | python3 -
 **Windows 安装命令**
 
 ```powershell
-(Invoke-WebRequest -Uri https://pdm-project.org/install-pdm.py -UseBasicParsing).Content | python -
+(Invoke-WebRequest -Uri https://pdm-project.org/install-pdm.py -UseBasicParsing).Content | py -
 ```
 
 为安全起见，你应该检查 `install-pdm.py` 文件的正确性。
@@ -165,10 +166,12 @@ pdm add requests flask
 在 README.md 中加入以下 Markdown 代码，向大家展示项目正在使用 PDM:
 
 ```markdown
-[![pdm-managed](https://img.shields.io/badge/pdm-managed-blueviolet)](https://pdm-project.org)
+[![pdm-managed](https://img.shields.io/endpoint?url=https%3A%2F%2Fcdn.jsdelivr.net%2Fgh%2Fpdm-project%2F.github%2Fbadge.json
+)](https://pdm-project.org)
 ```
 
-[![pdm-managed](https://img.shields.io/badge/pdm-managed-blueviolet)](https://pdm-project.org)
+[![pdm-managed](https://img.shields.io/endpoint?url=https%3A%2F%2Fcdn.jsdelivr.net%2Fgh%2Fpdm-project%2F.github%2Fbadge.json
+)](https://pdm-project.org)
 
 ## 打包状态
 

@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Iterator
 
 from installer import install as _install
 from installer._core import _process_WHEEL_file
-from installer.destinations import SchemeDictionaryDestination
+from installer.destinations import SchemeDictionaryDestination, WheelDestination
 from installer.exceptions import InvalidWheelSource
 from installer.records import RecordEntry
 from installer.sources import WheelContentElement, WheelSource
@@ -66,6 +66,8 @@ class PackageWheelSource(WheelSource):
     def iter_files(self) -> Iterable[Path]:
         for root, _, files in os.walk(self.package.path):
             for file in files:
+                if Path(root) == self.package.path and file in CachedPackage.cache_files:
+                    continue
                 yield Path(root, file)
 
     def get_contents(self) -> Iterator[WheelContentElement]:
@@ -95,12 +97,14 @@ class InstallDestination(SchemeDictionaryDestination):
         self,
         *args: Any,
         link_method: LinkMethod = "copy",
+        rename_pth: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.link_method = link_method
+        self.rename_pth = rename_pth
 
-    def write_to_fs(self, scheme: Scheme, path: str | Path, stream: BinaryIO, is_executable: bool) -> RecordEntry:
+    def write_to_fs(self, scheme: Scheme, path: str, stream: BinaryIO, is_executable: bool) -> RecordEntry:
         from installer.records import Hash
         from installer.utils import copyfileobj_with_hashing, make_file_executable
 
@@ -110,6 +114,10 @@ class InstallDestination(SchemeDictionaryDestination):
 
         os.makedirs(os.path.dirname(target_path), exist_ok=True)
 
+        if self.rename_pth and target_path.endswith(".pth") and "/" not in path:
+            # Postpone the creation of pth files since it may cause race condition
+            # when multiple packages are installed at the same time.
+            target_path += ".pdmtmp"
         if self.link_method == "copy" or not hasattr(stream, "name"):
             with open(target_path, "wb") as f:
                 hash_, size = copyfileobj_with_hashing(stream, f, self.hash_algorithm)
@@ -140,20 +148,21 @@ def _get_link_method(cache_method: str) -> LinkMethod:
     return "copy"
 
 
-def install_package(
-    package: CachedPackage,
+def install_wheel(
+    wheel: Path,
     environment: BaseEnvironment,
     direct_url: dict[str, Any] | None = None,
-    install_links: bool = True,
+    install_links: bool = False,
+    rename_pth: bool = False,
 ) -> str:
     """Only create .pth files referring to the cached package.
     If the cache doesn't exist, create one.
     """
     interpreter = str(environment.interpreter.executable)
     script_kind = environment.script_kind
-    # the cache_method can be any of "symlink", "hardlink" and "pth"
+    # the cache_method can be any of "symlink", "hardlink", "copy" and "pth"
     cache_method: str = environment.project.config["install.cache_method"]
-    dist_name = package.path.name.split("-")[0]
+    dist_name = wheel.name.split("-")[0]
     link_method: LinkMethod | None
     if not install_links or dist_name == "editables":
         link_method = "copy"
@@ -161,10 +170,6 @@ def install_package(
         link_method = _get_link_method(cache_method)
 
     additional_metadata: dict[str, bytes] = {}
-    if link_method == "symlink":
-        # Track usage when symlink is used
-        additional_metadata["REFER_TO"] = package.path.as_posix().encode()
-
     if direct_url is not None:
         additional_metadata["direct_url.json"] = json.dumps(direct_url, indent=2).encode()
 
@@ -173,16 +178,25 @@ def install_package(
         interpreter=interpreter,
         script_kind=script_kind,
         link_method=link_method,
+        rename_pth=rename_pth,
     )
-    source = PackageWheelSource(package)
-    dist_info_dir = install(source, destination=destination, additional_metadata=additional_metadata)
-    if link_method == "symlink":
-        package.add_referrer(dist_info_dir)
+    if install_links:
+        package = environment.project.package_cache.cache_wheel(wheel)
+        source = PackageWheelSource(package)
+        if link_method == "symlink":
+            # Track usage when symlink is used
+            additional_metadata["REFER_TO"] = package.path.as_posix().encode()
+        dist_info_dir = install(source, destination=destination, additional_metadata=additional_metadata)
+        if link_method == "symlink":
+            package.add_referrer(dist_info_dir)
+    else:
+        with WheelFile.open(wheel) as source:
+            dist_info_dir = install(source, destination=destination, additional_metadata=additional_metadata)
     return dist_info_dir
 
 
 def install(
-    source: WheelSource, destination: InstallDestination, additional_metadata: dict[str, bytes] | None = None
+    source: WheelSource, destination: WheelDestination, additional_metadata: dict[str, bytes] | None = None
 ) -> str:
     """A lower level installation method that is copied from installer
     but is controlled by extra parameters.
@@ -192,17 +206,3 @@ def install(
     _install(source, destination, additional_metadata=additional_metadata or {})
     root_scheme = _process_WHEEL_file(source)
     return os.path.join(destination.scheme_dict[root_scheme], source.dist_info_dir)
-
-
-def install_wheel(wheel: str, environment: BaseEnvironment, direct_url: dict[str, Any] | None = None) -> str:
-    """Install a wheel into the environment, return the .dist-info path"""
-    destination = InstallDestination(
-        scheme_dict=environment.get_paths(_get_dist_name(wheel)),
-        interpreter=str(environment.interpreter.executable),
-        script_kind=environment.script_kind,
-    )
-    additional_metadata = {}
-    if direct_url is not None:
-        additional_metadata["direct_url.json"] = json.dumps(direct_url, indent=2).encode()
-    with WheelFile.open(wheel) as source:
-        return install(source, destination, additional_metadata=additional_metadata)

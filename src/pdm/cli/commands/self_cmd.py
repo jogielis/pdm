@@ -6,18 +6,17 @@ import subprocess
 import sys
 from typing import Any
 
-from packaging.version import parse
-
 from pdm import termui
 from pdm.cli.actions import get_latest_pdm_version_from_pypi
 from pdm.cli.commands.base import BaseCommand
 from pdm.cli.options import verbose_option
-from pdm.cli.utils import Package, build_dependency_graph
+from pdm.cli.utils import PackageNode, build_dependency_graph
 from pdm.compat import Distribution
 from pdm.environments import BareEnvironment
+from pdm.models.markers import EnvSpec
 from pdm.models.working_set import WorkingSet
 from pdm.project import Project
-from pdm.utils import is_in_zipapp, normalize_name
+from pdm.utils import is_in_zipapp, normalize_name, parse_version
 
 PDM_REPO = "https://github.com/pdm-project/pdm"
 
@@ -28,7 +27,7 @@ def list_distributions(plugin_only: bool = False) -> list[Distribution]:
     for dist in working_set.values():
         if not plugin_only or any(ep.group in ("pdm", "pdm.plugin") for ep in dist.entry_points):
             result.append(dist)
-    return sorted(result, key=lambda d: d.metadata["Name"] or "UNKNOWN")
+    return sorted(result, key=lambda d: d.metadata.get("Name", "UNKNOWN"))
 
 
 def run_pip(project: Project, args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -98,12 +97,11 @@ class ListCommand(BaseCommand):
         echo("Installed packages:", err=True)
         rows = []
         for dist in distributions:
-            metadata = dist.metadata
             rows.append(
                 (
-                    f"[success]{metadata['Name']}[/]",
-                    f"[warning]{metadata['Version']}[/]",
-                    metadata["Summary"] or "",
+                    f"[success]{dist.metadata.get('Name')}[/]",
+                    f"[warning]{dist.metadata.get('Version')}[/]",
+                    dist.metadata.get("Summary", ""),
                 ),
             )
         project.core.ui.display_columns(rows)
@@ -161,14 +159,14 @@ class RemoveCommand(BaseCommand):
         to_resolve = list(packages)
 
         ws = WorkingSet()
-        graph = build_dependency_graph(ws)
+        graph = build_dependency_graph(ws, env_spec=EnvSpec.current())
         while to_resolve:
-            temp: list[Package] = []
+            temp: list[PackageNode] = []
             for name in to_resolve:
                 key = normalize_name(name)
                 if key in ws:
                     result.add(key)
-                package = Package(key, "0.0.0", {})
+                package = PackageNode(key, "0.0.0", {})
                 if package not in graph:
                     continue
                 for dep in graph.iter_children(package):
@@ -233,7 +231,7 @@ class UpdateCommand(BaseCommand):
         else:
             version = get_latest_pdm_version_from_pypi(project, options.pre)
             assert version is not None, "No version found"
-            if parse(__version__) >= parse(version):
+            if parse_version(__version__) >= parse_version(version):
                 project.core.ui.echo(f"Already up-to-date: [primary]{__version__}[/]")
                 return
             package = f"pdm=={version}"
@@ -248,6 +246,7 @@ class UpdateCommand(BaseCommand):
             )
             sys.exit(1)
         else:
-            project.core.ui.echo(f"[success]Installing version [primary]{version}[/] succeeds.[/]")
+            project.core.ui.echo(f"[success]Successfully installed version [primary]{version}[/][/]")
+            project.core.ui.echo(f"See what's new in this version: [link]{PDM_REPO}/releases/tag/{version}[/]")
             # Update the version value to avoid check update print wrong message
             project.core.version = read_version()

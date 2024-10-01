@@ -88,8 +88,10 @@ class GroupSelection:
             groups_set.update(dev_groups)
         if ":all" in groups:
             groups_set.discard(":all")
-            optional_groups -= set(self.excluded_groups)
             groups_set.update(optional_groups)
+        if default:
+            groups_set.add("default")
+        groups_set -= set(self.excluded_groups)
 
         invalid_groups = groups_set - set(project.iter_groups())
         if invalid_groups:
@@ -100,9 +102,7 @@ class GroupSelection:
             groups_set -= invalid_groups
         # Sorts the result in ascending order instead of in random order
         # to make this function pure
-        result = sorted(groups_set)
-        if default:
-            result.insert(0, "default")
+        result = sorted(groups_set, key=lambda x: (x != "default", x))
         return result
 
     def validate(self) -> None:

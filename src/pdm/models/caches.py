@@ -1,32 +1,28 @@
 from __future__ import annotations
 
 import contextlib
-import dataclasses
 import hashlib
 import json
 import os
 import stat
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, BinaryIO, Generic, Iterable, TypeVar, cast
+from typing import TYPE_CHECKING, Generic, Iterable, TypeVar
 
-from cachecontrol.cache import SeparateBodyBaseCache
-from cachecontrol.caches import FileCache
+import httpx
 from packaging.utils import canonicalize_name, parse_wheel_filename
 
 from pdm._types import CandidateInfo
 from pdm.exceptions import PdmException
 from pdm.models.cached_package import CachedPackage
 from pdm.models.candidates import Candidate
+from pdm.models.markers import EnvSpec
 from pdm.termui import logger
-from pdm.utils import atomic_open_for_write, create_tracked_tempdir, get_file_hash
+from pdm.utils import atomic_open_for_write, create_tracked_tempdir
 
 if TYPE_CHECKING:
-    from packaging.tags import Tag
-    from requests import Session
-    from unearth import Link, TargetPython
+    from unearth import Link
 
-    from pdm.environments import BaseEnvironment
 
 KT = TypeVar("KT")
 VT = TypeVar("VT")
@@ -70,17 +66,6 @@ class JSONFileCache(Generic[KT, VT]):
         self._cache[key] = value
         self._write_cache()
 
-    def delete(self, obj: KT) -> None:
-        try:
-            del self._cache[self._get_key(obj)]
-        except KeyError:
-            pass
-        self._write_cache()
-
-    def clear(self) -> None:
-        self._cache.clear()
-        self._write_cache()
-
 
 class CandidateInfoCache(JSONFileCache[Candidate, CandidateInfo]):
     """A cache manager that stores the
@@ -104,8 +89,7 @@ class CandidateInfoCache(JSONFileCache[Candidate, CandidateInfo]):
             raise KeyError("The package is missing a name or version")
         extras = "[{}]".format(",".join(sorted(obj.req.extras))) if obj.req.extras else ""
         version = obj.version
-        if not obj.req.is_named:
-            assert obj.link is not None
+        if obj.link is not None:
             version = cls.get_url_part(obj.link)
         return f"{obj.name}{extras}-{version}"
 
@@ -124,21 +108,21 @@ class HashCache:
     def __init__(self, directory: Path | str) -> None:
         self.directory = Path(directory)
 
-    def _read_from_link(self, link: Link, session: Session) -> Iterable[bytes]:
+    def _read_from_link(self, link: Link, session: httpx.Client) -> Iterable[bytes]:
         if link.is_file:
             with open(link.file_path, "rb") as f:
                 yield from f
         else:
-            import requests
+            import httpx
 
-            with session.get(link.normalized, stream=True) as resp:
+            with session.stream("GET", link.normalized) as resp:
                 try:
                     resp.raise_for_status()
-                except requests.HTTPError as e:
+                except httpx.HTTPStatusError as e:
                     raise PdmException(f"Failed to read from {link.redacted}: {e}") from e
-                yield from resp.iter_content(chunk_size=8192)
+                yield from resp.iter_bytes(chunk_size=8192)
 
-    def _get_file_hash(self, link: Link, session: Session) -> str:
+    def _get_file_hash(self, link: Link, session: httpx.Client) -> str:
         h = hashlib.new(self.FAVORITE_HASH)
         logger.debug("Downloading link %s for calculating hash", link.redacted)
         for chunk in self._read_from_link(link, session):
@@ -150,7 +134,7 @@ class HashCache:
         # We may add more when we know better about it.
         return not link.is_file
 
-    def get_hash(self, link: Link, session: Session) -> str:
+    def get_hash(self, link: Link, session: httpx.Client) -> str:
         # If there is no link hash (i.e., md5, sha256, etc.), we don't want
         # to store it.
         hash_value = self.get(link.url_without_fragment)
@@ -187,6 +171,22 @@ class HashCache:
                 fp.write(hash)
 
 
+class EmptyCandidateInfoCache(CandidateInfoCache):
+    def get(self, obj: Candidate) -> CandidateInfo:
+        raise KeyError
+
+    def set(self, obj: Candidate, value: CandidateInfo) -> None:
+        pass
+
+
+class EmptyHashCache(HashCache):
+    def get(self, url: str) -> str | None:
+        return None
+
+    def set(self, url: str, hash: str) -> None:
+        pass
+
+
 class WheelCache:
     """Caches wheels so we do not need to rebuild them.
 
@@ -206,49 +206,46 @@ class WheelCache:
             if candidate.name.endswith(".whl"):
                 yield candidate
 
-    def _get_path_parts(self, link: Link, target_python: TargetPython) -> tuple[str, ...]:
+    def _get_path_parts(self, link: Link, env_spec: EnvSpec) -> tuple[str, ...]:
         hash_key = {
             "url": link.url_without_fragment,
-            # target python participates in the hash key to handle the some cases
+            # target env participates in the hash key to handle the some cases
             # where the sdist produces different wheels on different Pythons, and
             # the differences are not encoded in compatibility tags.
-            "target_python": dataclasses.astuple(target_python),
+            "env_spec": env_spec.as_dict(),
         }
         if link.subdirectory:
             hash_key["subdirectory"] = link.subdirectory
-        if link.hash:
+        if link.hash and link.hash_name:
             hash_key[link.hash_name] = link.hash
         hashed = hashlib.sha224(
             json.dumps(hash_key, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
         ).hexdigest()
         return (hashed[:2], hashed[2:4], hashed[4:6], hashed[6:])
 
-    def get_path_for_link(self, link: Link, target_python: TargetPython) -> Path:
-        parts = self._get_path_parts(link, target_python)
+    def get_path_for_link(self, link: Link, env_spec: EnvSpec) -> Path:
+        parts = self._get_path_parts(link, env_spec)
         return self.directory.joinpath(*parts)
 
-    def get_ephemeral_path_for_link(self, link: Link, target_python: TargetPython) -> Path:
-        parts = self._get_path_parts(link, target_python)
+    def get_ephemeral_path_for_link(self, link: Link, env_spec: EnvSpec) -> Path:
+        parts = self._get_path_parts(link, env_spec)
         return self.ephemeral_directory.joinpath(*parts)
 
-    def get(self, link: Link, project_name: str | None, target_python: TargetPython) -> Path | None:
+    def get(self, link: Link, project_name: str | None, env_spec: EnvSpec) -> Path | None:
         if not project_name:
             return None
         canonical_name = canonicalize_name(project_name)
-        tags_priorities = {tag: i for i, tag in enumerate(target_python.supported_tags())}
 
-        candidate = self._get_from_path(self.get_path_for_link(link, target_python), canonical_name, tags_priorities)
+        candidate = self._get_from_path(self.get_path_for_link(link, env_spec), canonical_name, env_spec)
         if candidate is not None:
             return candidate
-        return self._get_from_path(
-            self.get_ephemeral_path_for_link(link, target_python), canonical_name, tags_priorities
-        )
+        return self._get_from_path(self.get_ephemeral_path_for_link(link, env_spec), canonical_name, env_spec)
 
-    def _get_from_path(self, path: Path, canonical_name: str, tags_priorities: dict[Tag, int]) -> Path | None:
-        candidates: list[tuple[int, Path]] = []
+    def _get_from_path(self, path: Path, canonical_name: str, env_spec: EnvSpec) -> Path | None:
+        max_compatible_candidate: tuple[tuple[int, ...], Path | None] = ((-1, -1, -1, -1), None)
         for candidate in self._get_candidates(path):
             try:
-                name, *_, tags = parse_wheel_filename(candidate.name)
+                name, *_ = parse_wheel_filename(candidate.name)
             except ValueError:
                 logger.debug("Ignoring invalid cached wheel %s", candidate.name)
                 continue
@@ -260,67 +257,12 @@ class WheelCache:
                     canonical_name,
                 )
                 continue
-            if tags.isdisjoint(tags_priorities):
+            compat = env_spec.wheel_compatibility(candidate.name)
+            if compat is None:
                 continue
-            support_min = min(tags_priorities[tag] for tag in tags if tag in tags_priorities)
-            candidates.append((support_min, candidate))
-        if not candidates:
-            return None
-        return min(candidates, key=lambda x: x[0])[1]
-
-
-class SafeFileCache(SeparateBodyBaseCache):
-    """
-    A file based cache which is safe to use even when the target directory may
-    not be accessible or writable.
-    """
-
-    def __init__(self, directory: str) -> None:
-        super().__init__()
-        self.directory = directory
-
-    def _get_cache_path(self, name: str) -> str:
-        # From cachecontrol.caches.file_cache.FileCache._fn, brought into our
-        # class for backwards-compatibility and to avoid using a non-public
-        # method.
-        hashed = FileCache.encode(name)
-        parts = [*list(hashed[:5]), hashed]
-        return os.path.join(self.directory, *parts)
-
-    def get(self, key: str) -> bytes | None:
-        path = self._get_cache_path(key)
-        with contextlib.suppress(OSError):
-            with open(path, "rb") as f:
-                return f.read()
-
-        return None
-
-    def get_body(self, key: str) -> BinaryIO | None:
-        path = self._get_cache_path(key)
-        with contextlib.suppress(OSError):
-            return cast(BinaryIO, open(f"{path}.body", "rb"))
-
-        return None
-
-    def set(self, key: str, value: bytes, expires: int | None = None) -> None:
-        path = self._get_cache_path(key)
-        with contextlib.suppress(OSError):
-            with atomic_open_for_write(path, mode="wb") as f:
-                cast(BinaryIO, f).write(value)
-
-    def set_body(self, key: str, body: bytes) -> None:
-        if body is None:
-            return
-
-        path = self._get_cache_path(key)
-        with contextlib.suppress(OSError):
-            with atomic_open_for_write(f"{path}.body", mode="wb") as f:
-                cast(BinaryIO, f).write(body)
-
-    def delete(self, key: str) -> None:
-        path = self._get_cache_path(key)
-        with contextlib.suppress(OSError):
-            os.remove(path)
+            if compat > max_compatible_candidate[0]:
+                max_compatible_candidate = (compat, candidate)
+        return max_compatible_candidate[1]
 
 
 @lru_cache(maxsize=None)
@@ -332,51 +274,44 @@ class PackageCache:
     def __init__(self, root: Path) -> None:
         self.root = root
 
-    def cache_wheel(self, wheel: Path, environment: BaseEnvironment, checksum: str | None = None) -> CachedPackage:
+    def cache_wheel(self, wheel: Path) -> CachedPackage:
         """Create a CachedPackage instance from a wheel file"""
         import zipfile
 
         from installer.utils import make_file_executable
 
-        if checksum is None:
-            checksum = get_file_hash(wheel)
-        parts = (checksum[:2], checksum[2:4], checksum[4:6], checksum[6:8], checksum[8:])
-        dest = self.root.joinpath(*parts, f"{wheel.name}.cache")
-        pkg = CachedPackage(dest)
+        dest = self.root.joinpath(f"{wheel.name}.cache")
+        pkg = CachedPackage(dest, original_wheel=wheel)
         if dest.exists():
             return pkg
         dest.mkdir(parents=True, exist_ok=True)
-        logger.info("Unpacking wheel into cached location %s", dest)
-        with zipfile.ZipFile(wheel) as zf:
-            for item in zf.infolist():
-                target_path = zf.extract(item, dest)
-                mode = item.external_attr >> 16
-                is_executable = bool(mode and stat.S_ISREG(mode) and mode & 0o111)
-                if is_executable:
-                    make_file_executable(target_path)
+        with pkg.lock():
+            logger.info("Unpacking wheel into cached location %s", dest)
+            with zipfile.ZipFile(wheel) as zf:
+                try:
+                    for item in zf.infolist():
+                        target_path = zf.extract(item, dest)
+                        mode = item.external_attr >> 16
+                        is_executable = bool(mode and stat.S_ISREG(mode) and mode & 0o111)
+                        if is_executable:
+                            make_file_executable(target_path)
+                except Exception:  # pragma: no cover
+                    pkg.cleanup()  # cleanup on any error
+                    raise
         return pkg
 
-    def iter_packages(self) -> Iterable[tuple[str, CachedPackage]]:
-        for path in self.root.rglob("*.cache"):
-            hash_parts = path.relative_to(self.root).parent.parts
-            yield "".join(hash_parts), CachedPackage(path)
+    def iter_packages(self) -> Iterable[CachedPackage]:
+        for path in self.root.rglob("*.whl.cache"):
+            p = CachedPackage(path)
+            with p.lock():  # ensure the package is not being created
+                pass
+            yield p
 
     def cleanup(self) -> int:
         """Remove unused cached packages"""
         count = 0
-        for _, pkg in self.iter_packages():
+        for pkg in self.iter_packages():
             if not any(os.path.exists(fn) for fn in pkg.referrers):
                 pkg.cleanup()
                 count += 1
         return count
-
-    def match_link(self, link: Link) -> CachedPackage | None:
-        """Match a link to a cached package"""
-        if not link.is_wheel:
-            return None
-        given_hash = link_hashes.get("sha256", []) if (link_hashes := link.hash_option) else []
-        for checksum, p in self.iter_packages():
-            if p.path.stem == link.filename and (not given_hash or checksum in given_hash):
-                logger.debug("Using package from cache location: %s", p.path)
-                return p
-        return None

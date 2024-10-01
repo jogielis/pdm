@@ -4,7 +4,6 @@ import argparse
 import csv
 import io
 import json
-import re
 from collections import defaultdict
 from fnmatch import fnmatch
 from typing import Iterable, Mapping, Sequence
@@ -14,10 +13,11 @@ from pdm.cli.commands.base import BaseCommand
 from pdm.cli.options import venv_option
 from pdm.cli.utils import (
     DirectedGraph,
-    Package,
+    PackageNode,
     build_dependency_graph,
     check_project_file,
     get_dist_location,
+    normalize_pattern,
     show_dependency_graph,
 )
 from pdm.compat import importlib_metadata as im
@@ -27,10 +27,6 @@ from pdm.project import Project
 
 # Group label for subdependencies
 SUBDEP_GROUP_LABEL = ":sub"
-
-
-def normalize_pattern(pattern: str) -> str:
-    return re.sub(r"[^A-Za-z0-9*?]+", "-", pattern).lower()
 
 
 class Command(BaseCommand):
@@ -132,9 +128,8 @@ class Command(BaseCommand):
         # Map dependency groups to requirements.
         name_to_groups: Mapping[str, set[str]] = defaultdict(set)
         for g in project.iter_groups():
-            for k in project.get_dependencies(g):
-                if "[" in k:
-                    k = k.split("[")[0]
+            for r in project.get_dependencies(g):
+                k = r.key or "unknown"
                 name_to_groups[k].add(g)
 
         # Set up `--include` and `--exclude` dep groups.
@@ -156,9 +151,7 @@ class Command(BaseCommand):
 
         # Requirements as importtools distributions (eg packages).
         # Resolve all the requirements. Map the candidates to distributions.
-        requirements = [
-            r for g in selected_groups if g != SUBDEP_GROUP_LABEL for r in project.get_dependencies(g).values()
-        ]
+        requirements = [r for g in selected_groups if g != SUBDEP_GROUP_LABEL for r in project.get_dependencies(g)]
         if options.resolve:
             candidates = actions.resolve_candidates_from_lockfile(
                 project, requirements, groups=selected_groups - {SUBDEP_GROUP_LABEL}
@@ -174,7 +167,7 @@ class Command(BaseCommand):
         selected_keys = {r.identify() for r in requirements}
         dep_graph = build_dependency_graph(
             packages,
-            project.environment.marker_environment,
+            project.environment.spec,
             None if not (include or exclude) else selected_keys,
             include_sub=SUBDEP_GROUP_LABEL in selected_groups,
         )
@@ -218,7 +211,7 @@ class Command(BaseCommand):
 
     def handle_graph(
         self,
-        dep_graph: DirectedGraph[Package | None],
+        dep_graph: DirectedGraph[PackageNode | None],
         project: Project,
         options: argparse.Namespace,
     ) -> None:
@@ -326,19 +319,19 @@ class Listable:
     def __init__(self, dist: im.Distribution, groups: set[str]):
         self.dist = dist
 
-        self.name: str | None = dist.metadata["Name"]
+        self.name = dist.metadata.get("Name")
         self.groups = "|".join(groups)
 
-        self.version: str | None = dist.metadata["Version"]
+        self.version = dist.metadata.get("Version")
         self.version = None if self.version == "UNKNOWN" else self.version
 
-        self.homepage: str | None = dist.metadata["Home-Page"]
+        self.homepage = dist.metadata.get("Home-Page")
         self.homepage = None if self.homepage == "UNKNOWN" else self.homepage
 
         # If the License metadata field is empty or UNKNOWN then try to
         # find the license in the Trove classifiers.  There may be more than one
         # so generate a pipe separated list (to avoid complexity with CSV export).
-        self.licenses: str | None = dist.metadata["License"]
+        self.licenses = dist.metadata.get("License")
         self.licenses = None if self.licenses == "UNKNOWN" else self.licenses
 
         # Sometimes package metadata contains the full license text.

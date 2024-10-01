@@ -7,6 +7,7 @@ from __future__ import annotations
 import atexit
 import contextlib
 import functools
+import inspect
 import json
 import os
 import re
@@ -17,11 +18,13 @@ import sysconfig
 import tempfile
 import urllib.parse as parse
 import warnings
+from datetime import datetime, timezone
 from os import name as os_name
 from pathlib import Path
 from typing import TYPE_CHECKING, Mapping
 
 from packaging.version import Version, _cmpkey
+from pbs_installer import PythonVersion
 
 from pdm.compat import importlib_metadata
 from pdm.exceptions import PDMDeprecationWarning, PdmException
@@ -40,7 +43,13 @@ try:
 except Exception:
     from packaging import __version__ as _packaging_version
 
-PACKAGING_22 = Version(_packaging_version) >= Version("22")
+
+@functools.lru_cache(maxsize=1024)
+def parse_version(version: str) -> Version:
+    return Version(version)
+
+
+PACKAGING_22 = parse_version(_packaging_version) >= parse_version("22")
 
 
 def create_tracked_tempdir(suffix: str | None = None, prefix: str | None = None, dir: str | None = None) -> str:
@@ -235,7 +244,7 @@ def expand_env_vars(credential: str, quote: bool = False, env: Mapping[str, str]
 
     def replace_func(match: Match) -> str:
         rv = env.get(match.group(1), match.group(0))
-        return parse.quote(rv) if quote else rv
+        return parse.quote(rv, "") if quote else rv
 
     return re.sub(r"\$\{(.+?)\}", replace_func, credential)
 
@@ -333,6 +342,7 @@ def get_rev_from_url(url: str) -> str:
     return ""
 
 
+@functools.lru_cache
 def normalize_name(name: str, lowercase: bool = True) -> str:
     name = re.sub(r"[^A-Za-z0-9]+", "-", name)
     return name.lower() if lowercase else name
@@ -340,7 +350,7 @@ def normalize_name(name: str, lowercase: bool = True) -> str:
 
 def comparable_version(version: str) -> Version:
     """Normalize a version to make it valid in a specifier."""
-    parsed = Version(version)
+    parsed = parse_version(version or "0.0.0")
     if parsed.local is not None:
         # strip the local part
         parsed._version = parsed._version._replace(local=None)
@@ -384,7 +394,7 @@ def pdm_scheme(base: str) -> dict[str, str]:
             "purelib": "{pep582_base}/lib",
             "platlib": "{pep582_base}/lib",
             "include": "{pep582_base}/include",
-            "scripts": "{pep582_base}/%s" % bin_prefix,
+            "scripts": f"{{pep582_base}}/{bin_prefix}",
             "data": "{pep582_base}",
             "prefix": "{pep582_base}",
             "headers": "{pep582_base}/include",
@@ -415,14 +425,14 @@ def fs_supports_link_method(method: str) -> bool:
         return True
 
 
-def deprecation_warning(message: str, stacklevel: int = 1, raise_since: str | None = None) -> None:
+def deprecation_warning(message: str, stacklevel: int = 1, raise_since: str | None = None) -> None:  # pragma: no cover
     """Show a deprecation warning with the given message and raise an error
     after a specified version.
     """
     from pdm.__version__ import __version__
 
     if raise_since is not None:
-        if Version(__version__) >= Version(raise_since):
+        if parse_version(__version__) >= parse_version(raise_since):
             raise PDMDeprecationWarning(message)
     warnings.warn(message, PDMDeprecationWarning, stacklevel=stacklevel + 1)
 
@@ -433,7 +443,7 @@ def is_pip_compatible_with_python(python_version: Version | str) -> bool:
     from pdm.models.specifiers import get_specifier
 
     pip = importlib_metadata.distribution("pip")
-    requires_python = get_specifier(pip.metadata["Requires-Python"])
+    requires_python = get_specifier(pip.metadata.get("Requires-Python"))
     return requires_python.contains(python_version, True)
 
 
@@ -523,3 +533,38 @@ def get_file_hash(filename: str | Path, algorithm: str = "sha256") -> str:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def convert_to_datetime(value: str) -> datetime:
+    if "T" in value:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+
+
+def get_all_installable_python_versions(build_dir: bool = False) -> list[PythonVersion]:
+    """Returns all installable standalone Python interpreter versions from @indygreg
+
+    Installable means:
+        Fitting current platform and arch
+
+    Parameters:
+        build_dir: Whether to include the `build/` directory from indygreg builds (aka 'Full Archive')
+    """
+    from pbs_installer._install import THIS_ARCH, THIS_PLATFORM
+    from pbs_installer._versions import PYTHON_VERSIONS
+
+    arch = "x86" if THIS_ARCH == "32" else THIS_ARCH
+    matches = [v for v, u in PYTHON_VERSIONS.items() if u.get((THIS_PLATFORM, arch, not build_dir))]
+    return matches
+
+
+def get_class_init_params(klass: type) -> set[str]:
+    arguments: set[str] = set()
+    for cls in klass.__mro__:
+        if "__init__" not in cls.__dict__:
+            continue
+        params = inspect.signature(cls).parameters
+        arguments.update({k for k, v in params.items() if v.kind not in (v.VAR_POSITIONAL, v.VAR_KEYWORD)})
+        if not any(p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD) for p in params.values()):
+            break
+    return arguments

@@ -32,7 +32,7 @@ def test_build_command(project, pdm, mocker):
         clean=True,
         hooks=mock.ANY,
     )
-    assert project.core.config_settings == {"a": "1", "b": "2"}
+    assert project.core.state.config_settings == {"a": "1", "b": "2"}
 
 
 def test_build_global_project_forbidden(pdm):
@@ -54,12 +54,15 @@ def test_build_single_module(fixture_project):
     ]:
         assert f"demo_module-0.1.0/{name}" in tar_names
 
-    zip_names = get_wheel_names(project.root / "dist/demo_module-0.1.0-py3-none-any.whl")
-    for name in ["foo_module.py", "bar_module.py"]:
-        assert name in zip_names
+    for i in range(2):
+        if i == 1:
+            Command.do_build(project, sdist=False)
+        zip_names = get_wheel_names(project.root / "dist/demo_module-0.1.0-py3-none-any.whl")
+        for name in ["foo_module.py", "bar_module.py"]:
+            assert name in zip_names
 
-    for name in ("pyproject.toml", "LICENSE"):
-        assert name not in zip_names
+        for name in ("pyproject.toml", "LICENSE"):
+            assert name not in zip_names
 
 
 def test_build_single_module_with_readme(fixture_project):
@@ -142,7 +145,7 @@ def test_build_src_package_by_include(fixture_project):
 
 def test_build_with_config_settings(fixture_project):
     project = fixture_project("demo-src-package")
-    project.core.config_settings = {"--plat-name": "win_amd64"}
+    project.core.state.config_settings = {"--plat-name": "win_amd64"}
     Command.do_build(project)
 
     assert (project.root / "dist/demo_package-0.1.0-py3-none-win_amd64.whl").exists()
@@ -156,17 +159,12 @@ def test_cli_build_with_config_settings(fixture_project, pdm):
 
 
 @pytest.mark.usefixtures("local_finder")
-@pytest.mark.parametrize("isolated", (True, False))
-def test_build_with_no_isolation(fixture_project, pdm, isolated):
-    project = fixture_project("demo-failure")
-    project.pyproject.set_data({"project": {"name": "demo", "version": "0.1.0"}})
-    project.pyproject.write()
-    pdm(["add", "first"], obj=project)
-    args = ["build"]
-    if not isolated:
-        args.append("--no-isolation")
-    result = pdm(args, obj=project)
-    assert result.exit_code == int(isolated)
+def test_build_with_no_isolation(pdm, project):
+    result = pdm(["build", "--no-isolation"], obj=project)
+    assert result.exit_code == 1
+    pdm(["add", "pdm-backend", "--no-self"], obj=project, strict=True)
+    result = pdm(["build", "--no-isolation"], obj=project)
+    assert result.exit_code == 0
 
 
 def test_build_ignoring_pip_environment(fixture_project, monkeypatch):

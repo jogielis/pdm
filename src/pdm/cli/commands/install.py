@@ -1,5 +1,6 @@
 import argparse
 import sys
+import sysconfig
 
 from pdm import termui
 from pdm.cli import actions
@@ -12,6 +13,7 @@ from pdm.cli.options import (
     groups_group,
     install_group,
     lockfile_option,
+    override_option,
     skip_option,
     venv_option,
 )
@@ -25,6 +27,7 @@ class Command(BaseCommand):
         *BaseCommand.arguments,
         groups_group,
         install_group,
+        override_option,
         dry_run_option,
         lockfile_option,
         frozen_lockfile_option,
@@ -43,16 +46,16 @@ class Command(BaseCommand):
     def install_plugins(self, project: Project) -> None:
         from pdm.environments import PythonEnvironment
         from pdm.installers.core import install_requirements
-        from pdm.models.requirements import parse_requirement
+        from pdm.models.requirements import parse_line
 
-        plugins = [
-            parse_requirement(r[3:], True) if r.startswith("-e ") else parse_requirement(r)
-            for r in project.pyproject.plugins
-        ]
+        plugins = [parse_line(r) for r in project.pyproject.plugins]
         if not plugins:
             return
         plugin_root = project.root / ".pdm-plugins"
-        environment = PythonEnvironment(project, python=sys.executable, prefix=str(plugin_root))
+        extra_paths = list({sysconfig.get_path("purelib"), sysconfig.get_path("platlib")})
+        environment = PythonEnvironment(
+            project, python=sys.executable, prefix=str(plugin_root), extra_paths=extra_paths
+        )
         with project.core.ui.open_spinner("[success]Installing plugins...[/]"):
             with project.core.ui.logging("install-plugins"):
                 install_requirements(

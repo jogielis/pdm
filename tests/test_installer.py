@@ -2,15 +2,23 @@ from __future__ import annotations
 
 import logging
 import os
+import venv
+from pathlib import Path
 from typing import Callable
 
 import pytest
 from unearth import Link
 
 from pdm import utils
+from pdm.core import Core
+from pdm.environments.base import BaseEnvironment
+from pdm.environments.local import PythonLocalEnvironment
+from pdm.environments.python import PythonEnvironment
 from pdm.installers import InstallManager
+from pdm.models.cached_package import CachedPackage
 from pdm.models.candidates import Candidate
 from pdm.models.requirements import parse_requirement
+from pdm.project.core import Project
 from tests import FIXTURES
 
 pytestmark = pytest.mark.usefixtures("local_finder")
@@ -29,6 +37,22 @@ def supports_link(preferred: str | None, monkeypatch: pytest.MonkeyPatch) -> Cal
 
     monkeypatch.setattr(utils, "fs_supports_link_method", mocked_support)
     return mocked_support
+
+
+def _prepare_project_for_env(project: Project, env_cls: type[BaseEnvironment]):
+    project._saved_python = None
+    project._python = None
+    if env_cls is PythonEnvironment:
+        venv.create(project.root / ".venv", symlinks=True)
+        project.project_config["python.use_venv"] = True
+
+
+@pytest.fixture(params=(PythonEnvironment, PythonLocalEnvironment), autouse=True)
+def environment(request: pytest.RequestFixture, project: Project) -> type[BaseEnvironment]:
+    # Run all test against all environments as installation and cache behavior may differ
+    env_cls: type[BaseEnvironment] = request.param
+    _prepare_project_for_env(project, env_cls)
+    return env_cls
 
 
 def test_install_wheel_with_inconsistent_dist_info(project):
@@ -133,13 +157,16 @@ def test_install_wheel_with_cache(project, pdm, supports_link):
         assert os.path.isfile(os.path.join(lib_path, "future_fstrings.py"))
         assert os.path.isfile(os.path.join(lib_path, "aaaaa_future_fstrings.pth"))
 
+    for file in CachedPackage.cache_files:
+        assert not os.path.exists(os.path.join(lib_path, file))
+
     cache_name = "future_fstrings-1.2.0-py2.py3-none-any.whl.cache"
-    assert any(p.path.name == cache_name for _, p in project.package_cache.iter_packages())
+    assert any(p.path.name == cache_name for p in project.package_cache.iter_packages())
     pdm(["run", "python", "-m", "site"], object=project)
     r = pdm(["run", "python", "-c", "import future_fstrings"], obj=project)
     assert r.exit_code == 0
     pdm(["cache", "clear", "packages"], obj=project, strict=True)
-    assert supports_link("symlink") is any(p.path.name == cache_name for _, p in project.package_cache.iter_packages())
+    assert supports_link("symlink") is any(p.path.name == cache_name for p in project.package_cache.iter_packages())
 
     dist = project.environment.get_working_set()["future-fstrings"]
     installer.uninstall(dist)
@@ -148,7 +175,41 @@ def test_install_wheel_with_cache(project, pdm, supports_link):
     assert not dist.read_text("direct_url.json")
 
     pdm(["cache", "clear", "packages"], obj=project, strict=True)
-    assert not any(p.path.name == cache_name for _, p in project.package_cache.iter_packages())
+    assert not any(p.path.name == cache_name for p in project.package_cache.iter_packages())
+
+
+@pytest.mark.parametrize("preferred", ["symlink", "hardlink", None])
+def test_can_install_wheel_with_cache_in_multiple_projects(
+    project: Project, core: Core, supports_link, tmp_path_factory, environment
+):
+    projects = []
+
+    for idx in range(3):
+        path: Path = tmp_path_factory.mktemp(f"project-{idx}")
+        p = core.create_project(path, global_config=project.global_config.config_file)
+        _prepare_project_for_env(p, environment)
+        projects.append(p)
+
+    req = parse_requirement("future-fstrings")
+    candidate = Candidate(
+        req,
+        link=Link("http://fixtures.test/artifacts/future_fstrings-1.2.0-py2.py3-none-any.whl"),
+    )
+
+    for p in projects:
+        installer = InstallManager(p.environment, use_install_cache=True)
+        installer.install(candidate)
+
+        lib_path = p.environment.get_paths()["purelib"]
+        if supports_link("symlink"):
+            assert os.path.islink(os.path.join(lib_path, "future_fstrings.py"))
+            assert os.path.islink(os.path.join(lib_path, "aaaaa_future_fstrings.pth"))
+        else:
+            assert os.path.isfile(os.path.join(lib_path, "future_fstrings.py"))
+            assert os.path.isfile(os.path.join(lib_path, "aaaaa_future_fstrings.pth"))
+
+        for file in CachedPackage.cache_files:
+            assert not os.path.exists(os.path.join(lib_path, file))
 
 
 def test_url_requirement_is_not_cached(project):
@@ -165,6 +226,35 @@ def test_url_requirement_is_not_cached(project):
     assert os.path.isfile(os.path.join(lib_path, "aaaaa_future_fstrings.pth"))
     dist = project.environment.get_working_set()["future-fstrings"]
     assert dist.read_text("direct_url.json")
+
+
+def test_editable_is_not_cached(project, tmp_path_factory):
+    editable_path: Path = tmp_path_factory.mktemp("editable-project")
+
+    editable_setup = editable_path / "setup.py"
+    editable_setup.write_text("""
+from setuptools import setup
+
+setup(name='editable-project',
+      version='0.1.0',
+      description='',
+      py_modules=['module'],
+)
+""")
+    editable_module = editable_path / "module.py"
+    editable_module.write_text("")
+
+    req = parse_requirement(f"file://{editable_path}#egg=editable-project", True)
+    candidate = Candidate(req)
+    installer = InstallManager(project.environment, use_install_cache=True)
+    installer.install(candidate)
+
+    cache_path = project.cache("packages") / "editable_project-0.1.0-0.editable-py3-none-any.whl.cache"
+    assert not cache_path.is_dir()
+    lib_path = Path(project.environment.get_paths()["purelib"])
+    for pth in lib_path.glob("*editable_project*.pth"):
+        assert pth.is_file()
+        assert not pth.is_symlink()
 
 
 @pytest.mark.parametrize("use_install_cache", [False, True])

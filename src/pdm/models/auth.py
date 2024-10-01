@@ -7,7 +7,7 @@ from unearth.utils import commonprefix, split_auth_from_url
 
 from pdm._types import RepositoryConfig
 from pdm.exceptions import PdmException
-from pdm.termui import UI, Verbosity
+from pdm.termui import UI, Verbosity, is_interactive
 
 
 class PdmBasicAuth(MultiDomainBasicAuth):
@@ -18,7 +18,7 @@ class PdmBasicAuth(MultiDomainBasicAuth):
     """
 
     def __init__(self, ui: UI, sources: list[RepositoryConfig]) -> None:
-        super().__init__(prompting=True)
+        super().__init__(prompting=is_interactive())
         self.sources = sources
         self.ui = ui
 
@@ -88,6 +88,19 @@ class Keyring:
             return False
         try:
             self.provider.save_auth_info(url, username, password)
+            return True
+        except Exception:
+            self.enabled = False
+            return False
+
+    def delete_auth_info(self, url: str, username: str) -> bool:
+        """Delete the password for the given url and username.
+        Returns whether the operation is successful.
+        """
+        if self.provider is None or not self.enabled:
+            return False
+        try:
+            self.provider.delete_auth_info(url, username)
             return True
         except Exception:
             self.enabled = False

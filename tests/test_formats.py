@@ -77,10 +77,16 @@ def test_convert_poetry(project):
     with cd(FIXTURES):
         result, settings = poetry.convert(project, golden_file, ns())
 
-    assert result["authors"][0] == {
-        "name": "Sébastien Eustace",
-        "email": "sebastien@eustace.io",
-    }
+    assert result["authors"] == [
+        {
+            "name": "Sébastien Eustace",
+            "email": "sebastien@eustace.io",
+        },
+        {
+            "name": "Example, Inc.",
+            "email": "inc@example.com",
+        },
+    ]
     assert result["name"] == "poetry"
     assert result["version"] == "1.0.0"
     assert result["license"] == {"text": "MIT"}
@@ -169,12 +175,12 @@ def test_import_requirements_with_group(project):
 
 
 def test_export_requirements_with_self(project):
-    result = requirements.export(project, [], ns(self=True))
+    result = requirements.export(project, [], ns(self=True, hashes=False))
     assert result.strip().splitlines()[-1] == ".  # this package"
 
 
 def test_export_requirements_with_editable_self(project):
-    result = requirements.export(project, [], ns(editable_self=True))
+    result = requirements.export(project, [], ns(editable_self=True, hashes=False))
     assert result.strip().splitlines()[-1] == "-e .  # this package"
 
 
@@ -228,3 +234,14 @@ def test_convert_setup_py_project(project):
         "scripts": {"mycli": "mymodule:main"},
     }
     assert settings == {"package-dir": "src"}
+
+
+def test_convert_poetry_project_with_circular_dependency(project):
+    parent_file = FIXTURES / "projects/poetry-with-circular-dep/pyproject.toml"
+    child_file = FIXTURES / "projects/poetry-with-circular-dep/packages/child/pyproject.toml"
+
+    _, settings = poetry.convert(project, parent_file, ns())
+    assert settings["dev-dependencies"]["dev"] == ["child @ file:///${PROJECT_ROOT}/packages/child"]
+
+    _, settings = poetry.convert(project, child_file, ns())
+    assert settings["dev-dependencies"]["dev"] == ["parent @ file:///${PROJECT_ROOT}/../.."]

@@ -27,26 +27,26 @@ import os
 import shutil
 import sys
 from dataclasses import dataclass
-from io import BufferedReader, BytesIO, StringIO
+from io import StringIO
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
-    BinaryIO,
     Callable,
     Dict,
+    Generator,
     Iterable,
     Iterator,
     Mapping,
+    MutableMapping,
     Tuple,
     Union,
     cast,
 )
-from urllib.parse import urlparse
 
+import httpx
 import pytest
-import requests
-from packaging.version import parse as parse_version
+from httpx._content import IteratorByteStream
 from pytest_mock import MockerFixture
 from unearth import Link
 
@@ -56,28 +56,33 @@ from pdm.exceptions import CandidateInfoNotFound
 from pdm.installers.installers import install_wheel
 from pdm.models.backends import DEFAULT_BACKEND
 from pdm.models.candidates import Candidate
-from pdm.models.repositories import BaseRepository
+from pdm.models.repositories import BaseRepository, CandidateMetadata
 from pdm.models.requirements import (
     Requirement,
     filter_requirements_with_extras,
     parse_requirement,
 )
-from pdm.models.session import PDMSession
+from pdm.models.session import PDMPyPIClient
 from pdm.project.config import Config
 from pdm.project.core import Project
-from pdm.utils import find_python_in_path, normalize_name, path_to_url
+from pdm.utils import find_python_in_path, normalize_name, parse_version, path_to_url
 
 if TYPE_CHECKING:
     from typing import Protocol
 
     from _pytest.fixtures import SubRequest
 
-    from pdm._types import CandidateInfo, FileHash, RepositoryConfig
+    from pdm._types import FileHash
 
 
-class LocalFileAdapter(requests.adapters.BaseAdapter):
+class FileByteStream(IteratorByteStream):
+    def close(self) -> None:
+        self._stream.close()  # type: ignore[attr-defined]
+
+
+class LocalIndexTransport(httpx.BaseTransport):
     """
-    A local file adapter for request.
+    A local file transport for HTTPX.
 
     Allows to mock some HTTP requests with some local files
     """
@@ -85,14 +90,13 @@ class LocalFileAdapter(requests.adapters.BaseAdapter):
     def __init__(
         self,
         aliases: dict[str, Path],
-        overrides: dict | None = None,
+        overrides: IndexOverrides | None = None,
         strip_suffix: bool = False,
     ):
         super().__init__()
         self.aliases = sorted(aliases.items(), key=lambda item: len(item[0]), reverse=True)
         self.overrides = overrides if overrides is not None else {}
         self.strip_suffix = strip_suffix
-        self._opened_files: list[BytesIO | BufferedReader | BinaryIO] = []
 
     def get_file_path(self, path: str) -> Path | None:
         for prefix, base_path in self.aliases:
@@ -106,46 +110,56 @@ class LocalFileAdapter(requests.adapters.BaseAdapter):
                 )
         return None
 
-    def send(
-        self,
-        request: requests.PreparedRequest,
-        stream: bool = False,
-        timeout: float | tuple[float, float] | tuple[float, None] | None = None,
-        verify: bool | str = True,
-        cert: str | bytes | tuple[bytes | str, str | bytes] | None = None,
-        proxies: Mapping[str, str] | None = None,
-    ) -> requests.models.Response:
-        request_path = str(urlparse(request.url).path)
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        request_path = request.url.path
         file_path = self.get_file_path(request_path)
-        response = requests.models.Response()
-        response.url = request.url or ""
-        response.request = request
+        headers: dict[str, str] = {}
+        stream: httpx.SyncByteStream | None = None
+        content: bytes | None = None
         if request_path in self.overrides:
-            response.status_code = 200
-            response.reason = "OK"
-            response.raw = BytesIO(self.overrides[request_path])
-            response.headers["Content-Type"] = "text/html"
+            status_code = 200
+            content = self.overrides[request_path]
+            headers["Content-Type"] = "text/html"
         elif file_path is None or not file_path.exists():
-            response.status_code = 404
-            response.reason = "Not Found"
-            response.raw = BytesIO(b"Not Found")
+            status_code = 404
         else:
-            response.status_code = 200
-            response.reason = "OK"
-            response.raw = file_path.open("rb")
+            status_code = 200
+            stream = FileByteStream(file_path.open("rb"))
             if file_path.suffix == ".html":
-                response.headers["Content-Type"] = "text/html"
-        self._opened_files.append(response.raw)
-        return response
-
-    def close(self) -> None:
-        for fp in self._opened_files:
-            fp.close()
-        self._opened_files.clear()
+                headers["Content-Type"] = "text/html"
+            elif file_path.suffix == ".json":
+                headers["Content-Type"] = "application/vnd.pypi.simple.v1+json"
+        return httpx.Response(status_code, headers=headers, content=content, stream=stream)
 
 
-class _FakeLink:
-    is_wheel = False
+class RepositoryData:
+    def __init__(self, pypi_json: Path) -> None:
+        self.pypi_data = self.load_fixtures(pypi_json)
+
+    @staticmethod
+    def load_fixtures(pypi_json: Path) -> dict[str, Any]:
+        return json.loads(pypi_json.read_text())
+
+    def add_candidate(self, name: str, version: str, requires_python: str = "") -> None:
+        pypi_data = self.pypi_data.setdefault(normalize_name(name), {}).setdefault(version, {})
+        pypi_data["requires_python"] = requires_python
+
+    def add_dependencies(self, name: str, version: str, requirements: list[str]) -> None:
+        pypi_data = self.pypi_data[normalize_name(name)][version]
+        pypi_data.setdefault("dependencies", []).extend(requirements)
+
+    def get_raw_dependencies(self, candidate: Candidate) -> tuple[str, list[str]]:
+        try:
+            pypi_data = self.pypi_data[cast(str, candidate.req.key)]
+            for version, data in sorted(pypi_data.items(), key=lambda item: len(item[0])):
+                base, *_ = version.partition("+")
+                if candidate.version in (version, base):
+                    return version, data.get("dependencies", [])
+        except KeyError:
+            pass
+        assert candidate.prepared is not None
+        meta = candidate.prepared.metadata
+        return meta.version, meta.requires or []
 
 
 class TestRepository(BaseRepository):
@@ -153,43 +167,26 @@ class TestRepository(BaseRepository):
     A mock repository to ease testing dependencies
     """
 
-    def __init__(self, sources: list[RepositoryConfig], environment: BaseEnvironment, pypi_json: Path):
-        super().__init__(sources, environment)
-        self._pypi_data = self.load_fixtures(pypi_json)
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._pypi_data = self.get_data()
 
-    def get_raw_dependencies(self, candidate: Candidate) -> tuple[str, list[str]]:
-        try:
-            pypi_data = self._pypi_data[cast(str, candidate.req.key)]
-            for version, data in sorted(pypi_data.items(), key=lambda item: len(item[0])):
-                base, *_ = version.partition("+")
-                if candidate.version in (version, base):
-                    return version, data.get("dependencies", [])
-        except KeyError:
-            pass
-        meta = candidate.prepare(self.environment).metadata
-        return meta.version, meta.requires or []
+    def get_data(self) -> dict[str, Any]:
+        raise NotImplementedError("To be injected by the fixture.")
 
-    def add_candidate(self, name: str, version: str, requires_python: str = "") -> None:
-        pypi_data = self._pypi_data.setdefault(normalize_name(name), {}).setdefault(version, {})
-        pypi_data["requires_python"] = requires_python
-
-    def add_dependencies(self, name: str, version: str, requirements: list[str]) -> None:
-        pypi_data = self._pypi_data[normalize_name(name)][version]
-        pypi_data.setdefault("dependencies", []).extend(requirements)
-
-    def _get_dependencies_from_fixture(self, candidate: Candidate) -> tuple[list[str], str, str]:
+    def _get_dependencies_from_fixture(self, candidate: Candidate) -> CandidateMetadata:
         try:
             pypi_data = self._pypi_data[cast(str, candidate.req.key)][cast(str, candidate.version)]
         except KeyError:
             raise CandidateInfoNotFound(candidate) from None
         deps = pypi_data.get("dependencies", [])
         deps = filter_requirements_with_extras(deps, candidate.req.extras or ())
-        return deps, pypi_data.get("requires_python", ""), ""
+        return CandidateMetadata(deps, pypi_data.get("requires_python", ""), "")
 
-    def dependency_generators(self) -> Iterable[Callable[[Candidate], CandidateInfo]]:
+    def dependency_generators(self) -> Iterable[Callable[[Candidate], CandidateMetadata]]:
         return (
             self._get_dependencies_from_cache,
-            self._get_dependency_from_local_package,
+            self._get_dependencies_from_local_package,
             self._get_dependencies_from_fixture,
             self._get_dependencies_from_metadata,
         )
@@ -209,12 +206,8 @@ class TestRepository(BaseRepository):
                 version=version,
             )
             c.requires_python = candidate.get("requires_python", "")
-            c.link = cast(Link, _FakeLink())
+            c.link = Link(f"https://mypypi.org/packages/{c.name}-{c.version}.tar.gz")
             yield c
-
-    @staticmethod
-    def load_fixtures(pypi_json: Path) -> dict[str, Any]:
-        return json.loads(pypi_json.read_text())
 
 
 class Metadata(dict):
@@ -294,7 +287,7 @@ class MockWorkingSet(collections.abc.MutableMapping):
 
 IndexMap = Dict[str, Path]
 """Path some root-relative http paths to some local paths"""
-IndexOverrides = Dict[str, str]
+IndexOverrides = Dict[str, bytes]
 """PyPI indexes overrides fixture format"""
 IndexesDefinition = Dict[str, Union[Tuple[IndexMap, IndexOverrides, bool], IndexMap]]
 """Mock PyPI indexes format"""
@@ -313,6 +306,16 @@ def build_env_wheels() -> Iterable[Path]:
     return []
 
 
+@pytest.fixture(autouse=True)
+def temp_env() -> Generator[MutableMapping[str, str]]:
+    old_env = os.environ.copy()
+    try:
+        yield os.environ
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)
+
+
 @pytest.fixture(scope="session")
 def build_env(build_env_wheels: Iterable[Path], tmp_path_factory: pytest.TempPathFactory) -> Path:
     """
@@ -328,7 +331,7 @@ def build_env(build_env_wheels: Iterable[Path], tmp_path_factory: pytest.TempPat
     p = Core().create_project(d)
     env = PythonEnvironment(p, prefix=str(d), python=sys.executable)
     for wheel in build_env_wheels:
-        install_wheel(str(wheel), env)
+        install_wheel(wheel, env)
     return d
 
 
@@ -347,13 +350,14 @@ _build_session = BaseEnvironment._build_session
 
 
 @pytest.fixture
-def pdm_session(pypi_indexes: IndexesDefinition) -> Callable[[Any], PDMSession]:
-    def get_pypi_session(*args: Any, **kwargs: Any) -> PDMSession:
-        session = _build_session(*args, **kwargs)
+def build_test_session(pypi_indexes: IndexesDefinition) -> Callable[..., PDMPyPIClient]:
+    def get_pypi_session(*args: Any, **kwargs: Any) -> PDMPyPIClient:
+        mounts: dict[str, httpx.BaseTransport] = {}
         for root, specs in pypi_indexes.items():
             index, overrides, strip = specs if isinstance(specs, tuple) else (specs, None, False)
-            session.mount(root, LocalFileAdapter(index, overrides=overrides, strip_suffix=strip))
-        return session
+            mounts[root] = LocalIndexTransport(index, overrides=overrides, strip_suffix=strip)
+        kwargs["mounts"] = mounts
+        return _build_session(*args, **kwargs)
 
     return get_pypi_session
 
@@ -382,7 +386,7 @@ def project_no_init(
     tmp_path: Path,
     mocker: MockerFixture,
     core: Core,
-    pdm_session: type[PDMSession],
+    build_test_session: Callable[..., PDMPyPIClient],
     monkeypatch: pytest.MonkeyPatch,
     build_env: Path,
 ) -> Project:
@@ -398,8 +402,9 @@ def project_no_init(
         '[global_project]\npath = "{}"\n'.format(test_home.joinpath("global-project").as_posix())
     )
     p = core.create_project(tmp_path, global_config=test_home.joinpath("config.toml").as_posix())
+    p.global_config["python.install_root"] = str(tmp_path / "pythons")
     p.global_config["venv.location"] = str(tmp_path / "venvs")
-    mocker.patch.object(BaseEnvironment, "_build_session", pdm_session)
+    mocker.patch.object(BaseEnvironment, "_build_session", build_test_session)
     mocker.patch("pdm.builders.base.EnvBuilder.get_shared_env", return_value=str(build_env))
     tmp_path.joinpath("caches").mkdir(parents=True)
     p.global_config["cache_dir"] = tmp_path.joinpath("caches").as_posix()
@@ -450,7 +455,7 @@ def project(project_no_init: Project) -> Project:
 
 
 @pytest.fixture
-def working_set(mocker: MockerFixture, repository: TestRepository) -> MockWorkingSet:
+def working_set(mocker: MockerFixture, repository: RepositoryData) -> MockWorkingSet:
     """
     a mock working set as a fixture
 
@@ -465,6 +470,7 @@ def working_set(mocker: MockerFixture, repository: TestRepository) -> MockWorkin
     class MockInstallManager(InstallManager):
         def install(self, candidate: Candidate) -> Distribution:  # type: ignore[override]
             key = normalize_name(candidate.name or "")
+            candidate.prepare(self.environment)
             version, dependencies = repository.get_raw_dependencies(candidate)
             dist = Distribution(key, version, candidate.req.editable)
             dist.dependencies = dependencies
@@ -525,20 +531,21 @@ def repository_pypi_json() -> Path:
 
 @pytest.fixture()
 def repository(
-    project: Project,
+    core: Core,
     mocker: MockerFixture,
     repository_pypi_json: Path,
     local_finder: type[None],
-) -> TestRepository:
+) -> RepositoryData:
     """
     A fixture providing a mock PyPI repository
 
     Returns:
         A mock repository
     """
-    rv = TestRepository([], project.environment, repository_pypi_json)
-    mocker.patch.object(project, "get_repository", return_value=rv)
-    return rv
+    repo = RepositoryData(repository_pypi_json)
+    core.repository_class = TestRepository
+    mocker.patch.object(TestRepository, "get_data", return_value=repo.pypi_data)
+    return repo
 
 
 @dataclass
@@ -585,6 +592,7 @@ if TYPE_CHECKING:
             input: str | None = None,
             obj: Project | None = None,
             env: Mapping[str, str] | None = None,
+            cleanup: bool = True,
             **kwargs: Any,
         ) -> RunResult:
             """
@@ -618,6 +626,7 @@ def pdm(core: Core, monkeypatch: pytest.MonkeyPatch) -> PDMCallable:
         input: str | None = None,
         obj: Project | None = None,
         env: Mapping[str, str] | None = None,
+        cleanup: bool = True,
         **kwargs: Any,
     ) -> RunResult:
         __tracebackhide__ = True
@@ -630,6 +639,7 @@ def pdm(core: Core, monkeypatch: pytest.MonkeyPatch) -> PDMCallable:
         args = args.split() if isinstance(args, str) else args
 
         with monkeypatch.context() as m:
+            old_env = os.environ.copy()
             m.setattr("sys.stdin", stdin)
             m.setattr("sys.stdout", stdout)
             m.setattr("sys.stderr", stderr)
@@ -642,6 +652,11 @@ def pdm(core: Core, monkeypatch: pytest.MonkeyPatch) -> PDMCallable:
             except Exception as e:
                 exit_code = 1
                 exception = e
+            finally:
+                os.environ.clear()
+                os.environ.update(old_env)
+                if cleanup:
+                    core.exit_stack.close()
 
         result = RunResult(exit_code, stdout.getvalue(), stderr.getvalue(), exception)
 
